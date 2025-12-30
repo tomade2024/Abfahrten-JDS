@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 
 # --------------------------------------------------
@@ -10,6 +10,41 @@ from pathlib import Path
 
 st.set_page_config(page_title="Abfahrten", layout="wide")
 DB_PATH = Path("abfahrten.db")
+
+# Einfache Login-Daten (BITTE anpassen!)
+USERS = {
+    "admin": "admin123",  # Benutzername: admin, Passwort: admin123
+}
+
+WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+WEEKDAY_TO_INT = {name: i for i, name in enumerate(WEEKDAYS_DE)}  # Montag = 0, ...
+
+
+# --------------------------------------------------
+# Login-Funktion
+# --------------------------------------------------
+
+def require_login():
+    """Einfacher Login-Schutz für den Admin-Bereich."""
+    if st.session_state.get("logged_in"):
+        return
+
+    st.title("Login")
+
+    with st.form("login_form"):
+        username = st.text_input("Benutzername")
+        password = st.text_input("Passwort", type="password")
+        submitted = st.form_submit_button("Einloggen")
+
+        if submitted:
+            if username in USERS and USERS[username] == password:
+                st.session_state["logged_in"] = True
+                st.success("Erfolgreich eingeloggt.")
+                st.rerun()
+            else:
+                st.error("Benutzername oder Passwort ist falsch.")
+
+    st.stop()
 
 
 # --------------------------------------------------
@@ -69,12 +104,12 @@ def init_db(conn: sqlite3.Connection):
     cnt = cur.fetchone()["cnt"]
     if cnt == 0:
         screens = [
-            (1, "Krankenhaus Monitor 1", "DETAIL",  "KRANKENHAUS", "", 15),
-            (2, "Krankenhaus Monitor 2", "DETAIL",  "KRANKENHAUS", "", 15),
-            (3, "Altenheim Monitor",     "DETAIL",  "ALTENHEIM",   "", 15),
-            (4, "MVZ Monitor",           "DETAIL",  "MVZ",         "", 15),
-            (5, "Übersicht Links",       "OVERVIEW","ALLE",        "", 20),
-            (6, "Übersicht Rechts",      "OVERVIEW","ALLE",        "", 20),
+            (1, "Zone A",           "DETAIL",   "KRANKENHAUS", "", 15),
+            (2, "Zone B",           "DETAIL",   "KRANKENHAUS", "", 15),
+            (3, "Zone C",           "DETAIL",   "ALTENHEIM",   "", 15),
+            (4, "Zone D",           "DETAIL",   "MVZ",         "", 15),
+            (5, "Übersicht Links",  "OVERVIEW", "ALLE",        "", 20),
+            (6, "Übersicht Rechts", "OVERVIEW", "ALLE",        "", 20),
         ]
         cur.executemany("""
             INSERT INTO screens (id, name, mode, filter_type, filter_locations, refresh_interval_seconds)
@@ -118,6 +153,27 @@ def load_departures_with_locations(conn):
 
 def load_screens(conn):
     return read_df(conn, "SELECT * FROM screens ORDER BY id")
+
+
+# --------------------------------------------------
+# Zeit-Helfer: nächster Termin für Wochentag + Stunde
+# --------------------------------------------------
+
+def next_datetime_for_weekday_hour(weekday_name: str, hour: int) -> datetime:
+    """Berechne den nächsten Termin (ab jetzt) für Wochentag + volle Stunde."""
+    now = datetime.now()
+    target_weekday = WEEKDAY_TO_INT[weekday_name]  # 0..6
+    today_weekday = now.weekday()
+
+    days_ahead = (target_weekday - today_weekday) % 7
+    candidate_date = now.date() + timedelta(days=days_ahead)
+    candidate_dt = datetime.combine(candidate_date, dtime(hour=hour, minute=0))
+
+    # Falls die Zeit heute schon vorbei ist → eine Woche weiter
+    if candidate_dt <= now:
+        candidate_dt = candidate_dt + timedelta(days=7)
+
+    return candidate_dt
 
 
 # --------------------------------------------------
@@ -190,8 +246,17 @@ def show_display_mode(screen_id: int):
         st.info("Keine Abfahrten.")
         return
 
-    # WICHTIG: Datum/Uhrzeit werden NICHT angezeigt – nur intern genutzt.
-    if screen["mode"] == "DETAIL":
+    # Monitore 1–4: keine Typen, Fahrzeuge oder Status – nur Einrichtung + Hinweis
+    if screen["mode"] == "DETAIL" and screen["id"] in [1, 2, 3, 4]:
+        view = data[["location_name", "note"]].copy()
+        view = view.rename(columns={
+            "location_name": "Einrichtung",
+            "note": "Hinweis",
+        })
+        st.dataframe(view, use_container_width=True, hide_index=True)
+
+    elif screen["mode"] == "DETAIL":
+        # Standard-Detail-Ansicht (falls später weitere Detail-Screens kommen)
         view = data[["location_name", "location_type", "vehicle", "status", "note"]].copy()
         view = view.rename(columns={
             "location_name": "Einrichtung",
@@ -274,43 +339,45 @@ def show_admin_departures(conn):
         st.warning("Bitte zuerst mindestens eine Einrichtung anlegen.")
         return
 
-    # Neue Abfahrt anlegen
+    # Neue Abfahrt anlegen – mit Wochentag + Stunde
     st.markdown("### Neue Abfahrt anlegen")
+
     with st.form("new_departure"):
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
+
         with col1:
-            dt_str = st.text_input("Datum & Uhrzeit (YYYY-MM-DD HH:MM)", "")
+            weekday = st.selectbox("Wochentag", WEEKDAYS_DE)
+        with col2:
+            hours = [f"{h:02d}:00" for h in range(24)]
+            hour_label = st.selectbox("Uhrzeit (volle Stunde)", hours, index=8)  # Standard: 08:00
+            hour_int = int(hour_label.split(":")[0])
+        with col3:
             loc_id = st.selectbox(
                 "Einrichtung",
                 options=locations["id"],
                 format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
             )
-        with col2:
-            vehicle = st.text_input("Fahrzeug (optional)", "")
-            status = st.selectbox("Status", ["GEPLANT", "UNTERWEGS", "ABGESCHLOSSEN", "STORNIERT"])
 
+        vehicle = st.text_input("Fahrzeug (optional)", "")
+        status = st.selectbox("Status", ["GEPLANT", "UNTERWEGS", "ABGESCHLOSSEN", "STORNIERT"])
         note = st.text_input("Hinweis (optional)", "")
 
         submitted = st.form_submit_button("Speichern")
         if submitted:
-            try:
-                dt = pd.to_datetime(dt_str)
-            except Exception:
-                st.error("Ungültiges Datum/Uhrzeit-Format. Beispiel: 2025-01-10 13:45")
-            else:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO departures (datetime, location_id, vehicle, status, note)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (dt.isoformat(), int(loc_id), vehicle.strip(), status, note.strip()),
-                )
-                conn.commit()
-                st.success("Abfahrt gespeichert.")
-                st.rerun()
+            dt = next_datetime_for_weekday_hour(weekday, hour_int)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO departures (datetime, location_id, vehicle, status, note)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (dt.isoformat(), int(loc_id), vehicle.strip(), status, note.strip()),
+            )
+            conn.commit()
+            st.success(f"Abfahrt gespeichert (nächster Termin: {dt.strftime('%Y-%m-%d %H:%M')}).")
+            st.rerun()
 
-    # Alle Abfahrten anzeigen + Löschbutton
+    # Bestehende Abfahrten anzeigen + Löschbutton
     st.markdown("### Bestehende Abfahrten")
 
     deps = load_departures_with_locations(conn)
@@ -318,13 +385,10 @@ def show_admin_departures(conn):
         st.info("Noch keine Abfahrten vorhanden.")
         return
 
-    # Sortierung
     deps = deps.sort_values("datetime")
 
-    # Wir zeigen Datum/Uhrzeit in der Admin-Ansicht weiter an,
-    # aber NICHT die ID. Die ID nutzen wir nur intern für den Löschbutton.
     for _, row in deps.iterrows():
-        with st.container(border=True):
+        with st.container():
             col1, col2 = st.columns([3, 1])
 
             # Linke Seite: Infos
@@ -354,13 +418,14 @@ def show_admin_departures(conn):
 
 
 # --------------------------------------------------
-# Admin-Ansicht: Screens
+# Admin-Ansicht: Screens (inkl. Links zu Monitoren)
 # --------------------------------------------------
 
 def show_admin_screens(conn):
     st.subheader("Screens / Monitore")
 
     screens = load_screens(conn)
+
     st.write("Aktuelle Konfiguration:")
     st.dataframe(screens, use_container_width=True)
 
@@ -368,7 +433,26 @@ def show_admin_screens(conn):
         st.info("Noch keine Screens vorhanden (werden beim ersten Start automatisch angelegt).")
         return
 
+    st.markdown("### Links zu den Monitoren")
+
+    st.info(
+        "Diese Links kannst du anklicken, um die jeweilige Monitoransicht zu öffnen, "
+        "oder die URL aus der Adressleiste kopieren und auf dem entsprechenden Monitor verwenden."
+    )
+
+    for _, row in screens.iterrows():
+        screen_id = int(row["id"])
+        name = row["name"]
+        link = f"?mode=display&screenId={screen_id}"
+        st.markdown(
+            f"- **Screen {screen_id} – {name}**: "
+            f"[Monitor öffnen]({link})  "
+            f"(URL-Parameter: `{link}`)"
+        )
+
+    st.markdown("---")
     st.markdown("### Screen bearbeiten")
+
     screen_ids = screens["id"].tolist()
     selected = st.selectbox("Screen wählen", screen_ids)
     row = screens.loc[screens["id"] == selected].iloc[0]
@@ -384,8 +468,7 @@ def show_admin_screens(conn):
         filter_locations = st.text_input(
             "Filter Locations (IDs, Komma-getrennt)",
             row["filter_locations"] or "",
-            help="Mehrere Krankenhäuser/Einrichtungen: z.B. 1,2,5. "
-                 "Leer lassen = alle Einrichtungen entsprechend Filter Typ.",
+            help="Mehrere Einrichtungen: z.B. 1,2,5. Leer lassen = alle Einrichtungen entsprechend Filter Typ.",
         )
         refresh = st.number_input(
             "Refresh-Intervall (Sekunden)",
@@ -411,7 +494,15 @@ def show_admin_screens(conn):
 # --------------------------------------------------
 
 def show_admin_mode():
+    require_login()  # Login erzwingen
+
     st.title("Abfahrten – Admin / Disposition")
+
+    # Logout-Button
+    if st.sidebar.button("Logout"):
+        st.session_state["logged_in"] = False
+        st.rerun()
+
     conn = get_connection()
 
     tabs = st.tabs(["Abfahrten", "Einrichtungen", "Screens"])
