@@ -69,12 +69,12 @@ def init_db(conn: sqlite3.Connection):
     cnt = cur.fetchone()["cnt"]
     if cnt == 0:
         screens = [
-            (1, "Krankenhaus Monitor 1", "DETAIL", "KRANKENHAUS", "", 15),
-            (2, "Krankenhaus Monitor 2", "DETAIL", "KRANKENHAUS", "", 15),
-            (3, "Altenheim Monitor",     "DETAIL", "ALTENHEIM",   "", 15),
-            (4, "MVZ Monitor",           "DETAIL", "MVZ",         "", 15),
-            (5, "Übersicht Links",       "OVERVIEW", "ALLE",      "", 20),
-            (6, "Übersicht Rechts",      "OVERVIEW", "ALLE",      "", 20),
+            (1, "Krankenhaus Monitor 1", "DETAIL",  "KRANKENHAUS", "", 15),
+            (2, "Krankenhaus Monitor 2", "DETAIL",  "KRANKENHAUS", "", 15),
+            (3, "Altenheim Monitor",     "DETAIL",  "ALTENHEIM",   "", 15),
+            (4, "MVZ Monitor",           "DETAIL",  "MVZ",         "", 15),
+            (5, "Übersicht Links",       "OVERVIEW","ALLE",        "", 20),
+            (6, "Übersicht Rechts",      "OVERVIEW","ALLE",        "", 20),
         ]
         cur.executemany("""
             INSERT INTO screens (id, name, mode, filter_type, filter_locations, refresh_interval_seconds)
@@ -130,7 +130,6 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
         return None, None
 
     screen = screens.loc[screens["id"] == screen_id].iloc[0]
-    mode = screen["mode"]
     filter_type = screen["filter_type"] or "ALLE"
     filter_locations = (screen["filter_locations"] or "").strip()
 
@@ -191,10 +190,10 @@ def show_display_mode(screen_id: int):
         st.info("Keine Abfahrten.")
         return
 
+    # WICHTIG: Datum/Uhrzeit werden NICHT angezeigt – nur intern genutzt.
     if screen["mode"] == "DETAIL":
-        view = data[["datetime", "location_name", "location_type", "vehicle", "status", "note"]].copy()
+        view = data[["location_name", "location_type", "vehicle", "status", "note"]].copy()
         view = view.rename(columns={
-            "datetime": "Datum/Uhrzeit",
             "location_name": "Einrichtung",
             "location_type": "Typ",
             "vehicle": "Fahrzeug",
@@ -204,7 +203,7 @@ def show_display_mode(screen_id: int):
         st.dataframe(view, use_container_width=True, hide_index=True)
 
     else:
-        # OVERVIEW: nach location_type gruppieren, max. 3 Spalten
+        # OVERVIEW: nach Typ gruppieren, max. 3 Spalten, ohne Uhrzeit
         grouped = list(data.groupby("location_type"))
         if not grouped:
             st.info("Keine Daten für Übersicht.")
@@ -216,8 +215,7 @@ def show_display_mode(screen_id: int):
             with col:
                 st.markdown(f"### {typ}")
                 for _, row in group.head(5).iterrows():
-                    dt_str = row["datetime"].strftime("%H:%M") if pd.notnull(row["datetime"]) else "-"
-                    txt = f"**{dt_str}** – {row['location_name']}"
+                    txt = f"**{row['location_name']}**"
                     if row.get("vehicle"):
                         txt += f" · {row['vehicle']}"
                     if row.get("note"):
@@ -265,7 +263,7 @@ def show_admin_locations(conn):
 
 
 # --------------------------------------------------
-# Admin-Ansicht: Abfahrten
+# Admin-Ansicht: Abfahrten (inkl. Löschen)
 # --------------------------------------------------
 
 def show_admin_departures(conn):
@@ -276,6 +274,7 @@ def show_admin_departures(conn):
         st.warning("Bitte zuerst mindestens eine Einrichtung anlegen.")
         return
 
+    # Neue Abfahrt anlegen
     st.markdown("### Neue Abfahrt anlegen")
     with st.form("new_departure"):
         col1, col2 = st.columns(2)
@@ -311,19 +310,47 @@ def show_admin_departures(conn):
                 st.success("Abfahrt gespeichert.")
                 st.rerun()
 
-    st.markdown("### Alle Abfahrten")
+    # Alle Abfahrten anzeigen + Löschbutton
+    st.markdown("### Bestehende Abfahrten")
+
     deps = load_departures_with_locations(conn)
     if deps.empty:
         st.info("Noch keine Abfahrten vorhanden.")
-    else:
-        view = deps[["id", "datetime", "location_name", "location_type", "vehicle", "status", "note"]].copy()
-        view = view.sort_values("datetime")
-        view = view.rename(columns={
-            "datetime": "Datum/Uhrzeit",
-            "location_name": "Einrichtung",
-            "location_type": "Typ",
-        })
-        st.dataframe(view, use_container_width=True)
+        return
+
+    # Sortierung
+    deps = deps.sort_values("datetime")
+
+    # Wir zeigen Datum/Uhrzeit in der Admin-Ansicht weiter an,
+    # aber NICHT die ID. Die ID nutzen wir nur intern für den Löschbutton.
+    for _, row in deps.iterrows():
+        with st.container(border=True):
+            col1, col2 = st.columns([3, 1])
+
+            # Linke Seite: Infos
+            with col1:
+                dt_str = row["datetime"].strftime("%Y-%m-%d %H:%M") if pd.notnull(row["datetime"]) else "-"
+                st.markdown(
+                    f"**{dt_str} – {row['location_name']} ({row['location_type']})**"
+                )
+                info = []
+                if row.get("vehicle"):
+                    info.append(f"Fahrzeug: {row['vehicle']}")
+                if row.get("status"):
+                    info.append(f"Status: {row['status']}")
+                if row.get("note"):
+                    info.append(f"Hinweis: {row['note']}")
+                if info:
+                    st.markdown("<br>".join(info), unsafe_allow_html=True)
+
+            # Rechte Seite: Löschbutton
+            with col2:
+                if st.button("Löschen", key=f"del_{row['id']}"):
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM departures WHERE id = ?", (int(row["id"]),))
+                    conn.commit()
+                    st.success("Abfahrt gelöscht.")
+                    st.rerun()
 
 
 # --------------------------------------------------
@@ -356,7 +383,9 @@ def show_admin_screens(conn):
         )
         filter_locations = st.text_input(
             "Filter Locations (IDs, Komma-getrennt)",
-            row["filter_locations"] or ""
+            row["filter_locations"] or "",
+            help="Mehrere Krankenhäuser/Einrichtungen: z.B. 1,2,5. "
+                 "Leer lassen = alle Einrichtungen entsprechend Filter Typ.",
         )
         refresh = st.number_input(
             "Refresh-Intervall (Sekunden)",
