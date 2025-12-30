@@ -274,10 +274,16 @@ def next_datetime_for_weekday_hour(weekday_name: str, hour: int) -> datetime:
 
 
 # --------------------------------------------------
-# Monitor-Ansicht (Display-Modus)
+# Monitor-Ansicht (Display-Modus) – inkl. Touren
 # --------------------------------------------------
 
 def get_screen_data(conn: sqlite3.Connection, screen_id: int):
+    """
+    Liefert für einen Screen:
+    - alle zukünftigen Abfahrten aus departures
+    - plus automatisch berechnete nächste Termine der Touren, die diesem Screen zugewiesen sind.
+    Beide werden zusammen sortiert zurückgegeben.
+    """
     screens = load_screens(conn)
     if screen_id not in screens["id"].tolist():
         return None, None
@@ -286,39 +292,127 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
     filter_type = screen["filter_type"] or "ALLE"
     filter_locations = (screen["filter_locations"] or "").strip()
 
-    deps = load_departures_with_locations(conn)
     now = datetime.now()
 
+    # 1. Normale Abfahrten laden
+    deps = load_departures_with_locations(conn)
     if deps.empty:
-        return screen, pd.DataFrame(
+        future = pd.DataFrame(
             columns=[
+                "id",
                 "datetime",
-                "location_name",
-                "location_type",
+                "location_id",
                 "vehicle",
                 "status",
                 "note",
+                "location_name",
+                "location_type",
+                "location_active",
                 "location_color",
                 "location_text_color",
             ]
         )
+    else:
+        future = deps[deps["datetime"] >= now].copy()
+        future = future[future["location_active"] == 1]
 
-    future = deps[deps["datetime"] >= now].copy()
+        if filter_type != "ALLE":
+            future = future[future["location_type"] == filter_type]
 
-    # Nur aktive Einrichtungen
-    future = future[future["location_active"] == 1]
+        if filter_locations:
+            ids = [int(x.strip()) for x in filter_locations.split(",") if x.strip().isdigit()]
+            if ids:
+                future = future[future["location_id"].isin(ids)]
 
-    # Filter nach Typ (KH/Altenheim/MVZ)
-    if filter_type != "ALLE":
-        future = future[future["location_type"] == filter_type]
+    # 2. Touren für diesen Screen -> virtuelle Abfahrten
+    tours_df = read_df(
+        conn,
+        """
+        SELECT t.id,
+               t.name,
+               t.weekday,
+               t.hour,
+               t.location_id,
+               t.note,
+               t.active,
+               t.screen_ids,
+               l.name       AS location_name,
+               l.type       AS location_type,
+               l.active     AS location_active,
+               l.color      AS location_color,
+               l.text_color AS location_text_color
+        FROM tours t
+        JOIN locations l ON t.location_id = l.id
+        """,
+    )
 
-    # Filter nach bestimmten Einrichtungen (IDs)
-    if filter_locations:
-        ids = [int(x.strip()) for x in filter_locations.split(",") if x.strip().isdigit()]
-        if ids:
-            future = future[future["location_id"].isin(ids)]
+    virtual_rows = []
 
-    future = future.sort_values("datetime")
+    if not tours_df.empty:
+        tours_df = tours_df[(tours_df["active"] == 1) & (tours_df["location_active"] == 1)]
+
+        def tour_has_screen(screen_ids_value):
+            if screen_ids_value is None:
+                return False
+            s = str(screen_ids_value).strip()
+            if s == "":
+                return False
+            for part in s.split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                try:
+                    sid = int(p)
+                except Exception:
+                    continue
+                if sid == screen_id:
+                    return True
+            return False
+
+        tours_df = tours_df[tours_df["screen_ids"].apply(tour_has_screen)]
+
+        if filter_type != "ALLE":
+            tours_df = tours_df[tours_df["location_type"] == filter_type]
+
+        if filter_locations:
+            ids = [int(x.strip()) for x in filter_locations.split(",") if x.strip().isdigit()]
+            if ids:
+                tours_df = tours_df[tours_df["location_id"].isin(ids)]
+
+        for _, row in tours_df.iterrows():
+            try:
+                hour_int = int(row["hour"])
+            except Exception:
+                hour_int = 0
+            next_dt = next_datetime_for_weekday_hour(row["weekday"], hour_int)
+            if next_dt < now:
+                continue
+
+            virtual_rows.append(
+                {
+                    "id": f"tour_{row['id']}",
+                    "datetime": next_dt,
+                    "location_id": row["location_id"],
+                    "vehicle": "",
+                    "status": "TOUR",
+                    "note": row["note"] or "",
+                    "location_name": row["location_name"],
+                    "location_type": row["location_type"],
+                    "location_active": row["location_active"],
+                    "location_color": row["location_color"],
+                    "location_text_color": row["location_text_color"],
+                }
+            )
+
+    if virtual_rows:
+        tours_future = pd.DataFrame(virtual_rows)
+        if future.empty:
+            future = tours_future
+        else:
+            future = pd.concat([future, tours_future], ignore_index=True)
+
+    if not future.empty:
+        future = future.sort_values("datetime")
 
     return screen, future
 
@@ -363,7 +457,6 @@ def escape_html(text: str) -> str:
 def show_display_mode(screen_id: int):
     """Anzeige für einen Monitor-Client (Display) mit Autorefresh, Sonderbild & Laufband."""
 
-    # Basis-CSS
     display_style = """
     <style>
     #MainMenu {visibility: hidden;}
@@ -391,7 +484,6 @@ def show_display_mode(screen_id: int):
         font-weight: 700;
     }
 
-    /* Laufband / Ticker */
     .ticker {
         position: fixed;
         bottom: 0;
@@ -423,7 +515,6 @@ def show_display_mode(screen_id: int):
     conn = get_connection()
     screen, data = get_screen_data(conn, screen_id)
 
-    # Autorefresh aktivieren (Intervall aus Screen-Konfiguration)
     interval_sec = 30
     if screen is not None and "refresh_interval_seconds" in screen.index:
         try:
@@ -437,7 +528,6 @@ def show_display_mode(screen_id: int):
         st.error(f"Screen {screen_id} ist nicht konfiguriert.")
         return
 
-    # Sonderplan / Feiertag → Vollbild schwarz + weiße Schrift
     holiday_active = bool(screen.get("holiday_flag", 0)) if "holiday_flag" in screen.index else False
     special_active = bool(screen.get("special_flag", 0)) if "special_flag" in screen.index else False
 
@@ -481,17 +571,14 @@ def show_display_mode(screen_id: int):
             """,
             unsafe_allow_html=True,
         )
-        # Keine weiteren Inhalte (keine Tabelle, kein Laufband)
         return
 
-    # Normale Ansicht (ohne Sonderplan/Feiertag)
     st.markdown(f"## {screen['name']} (Screen {screen_id})")
     st.caption(f"Modus: {screen['mode']} • Aktualisierung alle {interval_sec} Sekunden")
 
     if data is None or data.empty:
         st.info("Keine Abfahrten.")
     else:
-        # Monitore 1–4: nur Einrichtung + Hinweis, farbige Zeilen + Textfarbe
         if screen["mode"] == "DETAIL" and screen["id"] in [1, 2, 3, 4]:
             subset = data[["location_name", "note", "location_color", "location_text_color"]].copy()
             subset["location_color"] = subset["location_color"].fillna("")
@@ -525,7 +612,6 @@ def show_display_mode(screen_id: int):
             render_big_table(headers, rows, row_colors=row_colors, text_colors=row_text_colors)
 
         else:
-            # OVERVIEW: nach Typ gruppieren, Einträge farbig hinterlegt, Textfarbe berücksichtigt
             grouped = list(data.groupby("location_type"))
             if not grouped:
                 st.info("Keine Daten für Übersicht.")
@@ -552,7 +638,6 @@ def show_display_mode(screen_id: int):
 
                             st.markdown(f"<div style='{style_str}'>{txt}</div>", unsafe_allow_html=True)
 
-    # Laufband / Ticker (nur Normalmodus)
     ticker_row = load_ticker(conn)
     if ticker_row is not None and ticker_row["active"] and (ticker_row["text"] or "").strip():
         text = escape_html(ticker_row["text"].strip())
@@ -768,7 +853,6 @@ def show_admin_tours(conn, can_edit: bool):
     screens = load_screens(conn)
     screen_map = {int(r["id"]): r["name"] for _, r in screens.iterrows()} if not screens.empty else {}
 
-    # Übersicht aller Touren
     tours = load_tours(conn)
 
     st.write("Bestehende Touren:")
@@ -803,7 +887,6 @@ def show_admin_tours(conn, can_edit: bool):
     if not can_edit:
         return
 
-    # Neue Tour anlegen
     st.markdown("### Neue Tour anlegen")
 
     col1, col2, col3 = st.columns(3)
@@ -851,7 +934,6 @@ def show_admin_tours(conn, can_edit: bool):
             st.success("Tour gespeichert.")
             st.rerun()
 
-    # Bestehende Tour bearbeiten / Abfahrt erzeugen / löschen
     tours = load_tours(conn)
     if tours.empty:
         return
@@ -911,7 +993,6 @@ def show_admin_tours(conn, can_edit: bool):
         key=f"edit_tour_active_{selected}",
     )
 
-    # Bestehende Monitor-Zuweisung aus DB parsen
     existing_screen_ids = []
     if row["screen_ids"] not in (None, "", "None"):
         for part in str(row["screen_ids"]).split(","):
