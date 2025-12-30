@@ -4,24 +4,21 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-st.set_page_config(page_title="Abfahrten", layout="wide")
+# --------------------------------------------------
+# Grundeinstellungen
+# --------------------------------------------------
 
+st.set_page_config(page_title="Abfahrten", layout="wide")
 DB_PATH = Path("abfahrten.db")
 
-def do_rerun():
-    # Für neue Streamlit-Versionen
-    if hasattr(st, "rerun"):
-        st.rerun()
-    # Fallback für ältere Versionen
-    elif hasattr(st, "experimental_rerun"):
-        st.experimental_rerun()
 
 # --------------------------------------------------
-# DB-Helfer
+# DB-Verbindung + Initialisierung
 # --------------------------------------------------
 
 @st.cache_resource
 def get_connection():
+    """Erzeugt einmalig eine DB-Verbindung und initialisiert das Schema."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     init_db(conn)
@@ -29,9 +26,10 @@ def get_connection():
 
 
 def init_db(conn: sqlite3.Connection):
+    """Lege Tabellen an und füge Standard-Screens ein, falls noch nicht vorhanden."""
     cur = conn.cursor()
 
-    # Tabellen anlegen, falls nicht vorhanden
+    # Tabelle: Einrichtungen
     cur.execute("""
         CREATE TABLE IF NOT EXISTS locations (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,10 +39,11 @@ def init_db(conn: sqlite3.Connection):
         )
     """)
 
+    # Tabelle: Abfahrten
     cur.execute("""
         CREATE TABLE IF NOT EXISTS departures (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            datetime     TEXT NOT NULL,
+            datetime     TEXT NOT NULL,       -- ISO-String
             location_id  INTEGER NOT NULL,
             vehicle      TEXT,
             status       TEXT NOT NULL DEFAULT 'GEPLANT',
@@ -53,6 +52,7 @@ def init_db(conn: sqlite3.Connection):
         )
     """)
 
+    # Tabelle: Screens / Monitore
     cur.execute("""
         CREATE TABLE IF NOT EXISTS screens (
             id                        INTEGER PRIMARY KEY,
@@ -64,43 +64,50 @@ def init_db(conn: sqlite3.Connection):
         )
     """)
 
-    # Standard-Screens anlegen, wenn Tabelle leer ist
+    # Standard-Screens anlegen, falls noch keine vorhanden sind
     cur.execute("SELECT COUNT(*) AS cnt FROM screens")
     cnt = cur.fetchone()["cnt"]
     if cnt == 0:
         screens = [
             (1, "Krankenhaus Monitor 1", "DETAIL", "KRANKENHAUS", "", 15),
             (2, "Krankenhaus Monitor 2", "DETAIL", "KRANKENHAUS", "", 15),
-            (3, "Altenheim Monitor", "DETAIL", "ALTENHEIM", "", 15),
-            (4, "MVZ Monitor", "DETAIL", "MVZ", "", 15),
-            (5, "Übersicht Links", "OVERVIEW", "ALLE", "", 20),
-            (6, "Übersicht Rechts", "OVERVIEW", "ALLE", "", 20),
+            (3, "Altenheim Monitor",     "DETAIL", "ALTENHEIM",   "", 15),
+            (4, "MVZ Monitor",           "DETAIL", "MVZ",         "", 15),
+            (5, "Übersicht Links",       "OVERVIEW", "ALLE",      "", 20),
+            (6, "Übersicht Rechts",      "OVERVIEW", "ALLE",      "", 20),
         ]
-        cur.executemany(
-            "INSERT INTO screens (id, name, mode, filter_type, filter_locations, refresh_interval_seconds) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            screens,
-        )
+        cur.executemany("""
+            INSERT INTO screens (id, name, mode, filter_type, filter_locations, refresh_interval_seconds)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, screens)
 
     conn.commit()
 
+
+# --------------------------------------------------
+# Hilfsfunktionen für DB -> DataFrame
+# --------------------------------------------------
 
 def read_df(conn: sqlite3.Connection, query: str, params=()):
     return pd.read_sql_query(query, conn, params=params)
 
 
-# --------------------------------------------------
-# Daten-Ladefunktionen
-# --------------------------------------------------
-
 def load_locations(conn):
     return read_df(conn, "SELECT id, name, type, active FROM locations ORDER BY id")
 
 
-def load_departures(conn):
+def load_departures_with_locations(conn):
+    """Abfahrten inkl. Einrichtungsnamen/-typ."""
     df = read_df(conn, """
-        SELECT d.id, d.datetime, d.location_id, d.vehicle, d.status, d.note,
-               l.name AS location_name, l.type AS location_type
+        SELECT d.id,
+               d.datetime,
+               d.location_id,
+               d.vehicle,
+               d.status,
+               d.note,
+               l.name AS location_name,
+               l.type AS location_type,
+               l.active AS location_active
         FROM departures d
         JOIN locations l ON d.location_id = l.id
     """)
@@ -114,7 +121,7 @@ def load_screens(conn):
 
 
 # --------------------------------------------------
-# Monitor-Ansicht (Display)
+# Monitor-Ansicht (Display-Modus)
 # --------------------------------------------------
 
 def get_screen_data(conn: sqlite3.Connection, screen_id: int):
@@ -127,24 +134,22 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
     filter_type = screen["filter_type"] or "ALLE"
     filter_locations = (screen["filter_locations"] or "").strip()
 
-    departures_all = load_departures(conn)
+    deps = load_departures_with_locations(conn)
     now = datetime.now()
 
-    if departures_all.empty:
+    if deps.empty:
         return screen, pd.DataFrame(columns=["datetime", "location_name", "location_type", "vehicle", "status", "note"])
 
-    future = departures_all[departures_all["datetime"] >= now].copy()
+    future = deps[deps["datetime"] >= now].copy()
 
-    # Filter aktive Einrichtungen
-    locs = load_locations(conn)
-    active_ids = locs[locs["active"] == 1]["id"].tolist()
-    future = future[future["location_id"].isin(active_ids)]
+    # Nur aktive Einrichtungen
+    future = future[future["location_active"] == 1]
 
-    # Filter Typ
+    # Filter nach Typ (KH/Altenheim/MVZ)
     if filter_type != "ALLE":
         future = future[future["location_type"] == filter_type]
 
-    # Filter bestimmte Einrichtungen
+    # Filter nach bestimmten Einrichtungen (IDs)
     if filter_locations:
         ids = [int(x.strip()) for x in filter_locations.split(",") if x.strip().isdigit()]
         if ids:
@@ -156,6 +161,9 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
 
 
 def show_display_mode(screen_id: int):
+    """Anzeige für einen Monitor-Client (Display)."""
+
+    # Streamlit-Menü & Footer ausblenden
     hide_style = """
     <style>
     #MainMenu {visibility: hidden;}
@@ -166,7 +174,7 @@ def show_display_mode(screen_id: int):
     st.markdown(hide_style, unsafe_allow_html=True)
 
     if not screen_id:
-        st.error("Parameter 'screenId' fehlt oder ungültig.")
+        st.error("Parameter 'screenId' fehlt oder ist ungültig.")
         return
 
     conn = get_connection()
@@ -194,11 +202,14 @@ def show_display_mode(screen_id: int):
             "note": "Hinweis",
         })
         st.dataframe(view, use_container_width=True, hide_index=True)
+
     else:
+        # OVERVIEW: nach location_type gruppieren, max. 3 Spalten
         grouped = list(data.groupby("location_type"))
         if not grouped:
             st.info("Keine Daten für Übersicht.")
             return
+
         cols = st.columns(3)
         for idx, (typ, group) in enumerate(grouped):
             col = cols[idx % 3]
@@ -215,13 +226,14 @@ def show_display_mode(screen_id: int):
 
 
 # --------------------------------------------------
-# Admin-Ansicht
+# Admin-Ansicht: Einrichtungen
 # --------------------------------------------------
 
 def show_admin_locations(conn):
     st.subheader("Einrichtungen")
 
     locations = load_locations(conn)
+
     st.write("Bestehende Einrichtungen:")
     if locations.empty:
         st.info("Noch keine Einrichtungen vorhanden.")
@@ -236,6 +248,7 @@ def show_admin_locations(conn):
             typ = st.selectbox("Typ", ["KRANKENHAUS", "ALTENHEIM", "MVZ"])
         with col2:
             active = st.checkbox("Aktiv", value=True)
+
         submitted = st.form_submit_button("Speichern")
         if submitted:
             if not name.strip():
@@ -248,15 +261,19 @@ def show_admin_locations(conn):
                 )
                 conn.commit()
                 st.success("Einrichtung gespeichert.")
-                st.experimental_rerun()
+                st.rerun()
 
+
+# --------------------------------------------------
+# Admin-Ansicht: Abfahrten
+# --------------------------------------------------
 
 def show_admin_departures(conn):
     st.subheader("Abfahrten")
 
     locations = load_locations(conn)
     if locations.empty:
-        st.warning("Bitte zuerst Einrichtungen anlegen.")
+        st.warning("Bitte zuerst mindestens eine Einrichtung anlegen.")
         return
 
     st.markdown("### Neue Abfahrt anlegen")
@@ -272,6 +289,7 @@ def show_admin_departures(conn):
         with col2:
             vehicle = st.text_input("Fahrzeug (optional)", "")
             status = st.selectbox("Status", ["GEPLANT", "UNTERWEGS", "ABGESCHLOSSEN", "STORNIERT"])
+
         note = st.text_input("Hinweis (optional)", "")
 
         submitted = st.form_submit_button("Speichern")
@@ -283,51 +301,69 @@ def show_admin_departures(conn):
             else:
                 cur = conn.cursor()
                 cur.execute(
-                    "INSERT INTO departures (datetime, location_id, vehicle, status, note) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    """
+                    INSERT INTO departures (datetime, location_id, vehicle, status, note)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
                     (dt.isoformat(), int(loc_id), vehicle.strip(), status, note.strip()),
                 )
                 conn.commit()
                 st.success("Abfahrt gespeichert.")
-                st.experimental_rerun()
+                st.rerun()
 
     st.markdown("### Alle Abfahrten")
-    deps = load_departures(conn)
+    deps = load_departures_with_locations(conn)
     if deps.empty:
         st.info("Noch keine Abfahrten vorhanden.")
     else:
         view = deps[["id", "datetime", "location_name", "location_type", "vehicle", "status", "note"]].copy()
         view = view.sort_values("datetime")
+        view = view.rename(columns={
+            "datetime": "Datum/Uhrzeit",
+            "location_name": "Einrichtung",
+            "location_type": "Typ",
+        })
         st.dataframe(view, use_container_width=True)
 
+
+# --------------------------------------------------
+# Admin-Ansicht: Screens
+# --------------------------------------------------
 
 def show_admin_screens(conn):
     st.subheader("Screens / Monitore")
 
     screens = load_screens(conn)
+    st.write("Aktuelle Konfiguration:")
     st.dataframe(screens, use_container_width=True)
 
-    st.markdown("### Screen bearbeiten")
     if screens.empty:
-        st.info("Noch keine Screens vorhanden.")
+        st.info("Noch keine Screens vorhanden (werden beim ersten Start automatisch angelegt).")
         return
 
+    st.markdown("### Screen bearbeiten")
     screen_ids = screens["id"].tolist()
     selected = st.selectbox("Screen wählen", screen_ids)
     row = screens.loc[screens["id"] == selected].iloc[0]
 
     with st.form("edit_screen"):
         name = st.text_input("Name", row["name"])
-        mode = st.selectbox("Modus", ["DETAIL", "OVERVIEW"], index=["DETAIL", "OVERVIEW"].index(row["mode"]))
+        mode = st.selectbox("Modus", ["DETAIL", "OVERVIEW"],
+                            index=["DETAIL", "OVERVIEW"].index(row["mode"]))
         filter_type = st.selectbox(
             "Filter Typ", ["ALLE", "KRANKENHAUS", "ALTENHEIM", "MVZ"],
             index=["ALLE", "KRANKENHAUS", "ALTENHEIM", "MVZ"].index(row["filter_type"])
         )
-        filter_locations = st.text_input("Filter Locations (IDs, Komma-getrennt)", row["filter_locations"] or "")
+        filter_locations = st.text_input(
+            "Filter Locations (IDs, Komma-getrennt)",
+            row["filter_locations"] or ""
+        )
         refresh = st.number_input(
-            "Refresh-Intervall (Sekunden)", min_value=5, max_value=300,
+            "Refresh-Intervall (Sekunden)",
+            min_value=5, max_value=300,
             value=int(row["refresh_interval_seconds"]),
         )
+
         submitted = st.form_submit_button("Speichern")
         if submitted:
             cur = conn.cursor()
@@ -338,8 +374,12 @@ def show_admin_screens(conn):
             """, (name, mode, filter_type, filter_locations, int(refresh), int(selected)))
             conn.commit()
             st.success("Screen aktualisiert.")
-            st.experimental_rerun()
+            st.rerun()
 
+
+# --------------------------------------------------
+# Admin-Modus (Hauptansicht)
+# --------------------------------------------------
 
 def show_admin_mode():
     st.title("Abfahrten – Admin / Disposition")
@@ -355,7 +395,7 @@ def show_admin_mode():
 
 
 # --------------------------------------------------
-# Einstieg
+# Einstiegspunkt
 # --------------------------------------------------
 
 def main():
