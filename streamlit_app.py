@@ -66,7 +66,7 @@ def init_db(conn: sqlite3.Connection):
     """Lege Tabellen an und füge Standard-Screens ein, falls noch nicht vorhanden."""
     cur = conn.cursor()
 
-    # Tabelle: Einrichtungen (mit color)
+    # Tabelle: Einrichtungen
     cur.execute("""
         CREATE TABLE IF NOT EXISTS locations (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +90,20 @@ def init_db(conn: sqlite3.Connection):
             vehicle      TEXT,
             status       TEXT NOT NULL DEFAULT 'GEPLANT',
             note         TEXT,
+            FOREIGN KEY(location_id) REFERENCES locations(id)
+        )
+    """)
+
+    # Tabelle: feste Touren
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tours (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            weekday      TEXT NOT NULL,       -- z.B. 'Montag'
+            hour         INTEGER NOT NULL,    -- 0-23
+            location_id  INTEGER NOT NULL,
+            note         TEXT,
+            active       INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY(location_id) REFERENCES locations(id)
         )
     """)
@@ -135,7 +149,6 @@ def read_df(conn: sqlite3.Connection, query: str, params=()):
 
 
 def load_locations(conn):
-    # color mit auslesen
     return read_df(conn, "SELECT id, name, type, active, color FROM locations ORDER BY id")
 
 
@@ -148,10 +161,10 @@ def load_departures_with_locations(conn):
                d.vehicle,
                d.status,
                d.note,
-               l.name  AS location_name,
-               l.type  AS location_type,
+               l.name   AS location_name,
+               l.type   AS location_type,
                l.active AS location_active,
-               l.color AS location_color
+               l.color  AS location_color
         FROM departures d
         JOIN locations l ON d.location_id = l.id
     """)
@@ -162,6 +175,22 @@ def load_departures_with_locations(conn):
 
 def load_screens(conn):
     return read_df(conn, "SELECT * FROM screens ORDER BY id")
+
+
+def load_tours(conn):
+    return read_df(conn, """
+        SELECT t.id,
+               t.name,
+               t.weekday,
+               t.hour,
+               t.location_id,
+               t.note,
+               t.active,
+               l.name  AS location_name
+        FROM tours t
+        JOIN locations l ON t.location_id = l.id
+        ORDER BY t.id
+    """)
 
 
 # --------------------------------------------------
@@ -230,7 +259,7 @@ def render_big_table(headers, rows, row_colors=None):
     thead_cells = "".join(f"<th>{h}</th>" for h in headers)
     body_rows = ""
 
-    rows = list(rows)  # Iterator in Liste umwandeln, um idx zu haben
+    rows = list(rows)  # Iterator in Liste umwandeln
 
     for idx, r in enumerate(rows):
         style = ""
@@ -358,7 +387,7 @@ def show_display_mode(screen_id: int):
 
 
 # --------------------------------------------------
-# Admin-Ansicht: Einrichtungen
+# Admin-Ansicht: Einrichtungen (voll editierbar + löschen)
 # --------------------------------------------------
 
 def show_admin_locations(conn):
@@ -398,7 +427,7 @@ def show_admin_locations(conn):
                 st.rerun()
 
     if not locations.empty:
-        st.markdown("### Einrichtung bearbeiten")
+        st.markdown("### Einrichtung bearbeiten / löschen")
         loc_ids = locations["id"].tolist()
         selected = st.selectbox("Einrichtung auswählen", loc_ids)
         row = locations.loc[locations["id"] == selected].iloc[0]
@@ -417,7 +446,12 @@ def show_admin_locations(conn):
                 color_init = row["color"] if isinstance(row["color"], str) and row["color"] else "#007bff"
                 color_edit = st.color_picker("Farbe", color_init)
 
-            submitted_edit = st.form_submit_button("Änderungen speichern")
+            col_btn1, col_btn2 = st.columns(2)
+            with col_btn1:
+                submitted_edit = st.form_submit_button("Änderungen speichern")
+            with col_btn2:
+                delete_requested = st.form_submit_button("Einrichtung löschen")
+
             if submitted_edit:
                 cur = conn.cursor()
                 cur.execute(
@@ -427,6 +461,25 @@ def show_admin_locations(conn):
                 conn.commit()
                 st.success("Einrichtung aktualisiert.")
                 st.rerun()
+
+            if delete_requested:
+                # Prüfen, ob noch Abfahrten oder Touren auf diese Einrichtung zeigen
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM departures WHERE location_id = ?", (int(selected),))
+                dep_count = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM tours WHERE location_id = ?", (int(selected),))
+                tour_count = cur.fetchone()[0]
+
+                if dep_count > 0 or tour_count > 0:
+                    st.error(
+                        f"Einrichtung kann nicht gelöscht werden – es existieren noch "
+                        f"{dep_count} Abfahrten und {tour_count} Tour(en) für diese Einrichtung."
+                    )
+                else:
+                    cur.execute("DELETE FROM locations WHERE id = ?", (int(selected),))
+                    conn.commit()
+                    st.success("Einrichtung gelöscht.")
+                    st.rerun()
 
 
 # --------------------------------------------------
@@ -511,12 +564,160 @@ def show_admin_departures(conn):
 
             # Rechte Seite: Löschbutton
             with col2:
-                if st.button("Löschen", key=f"del_{row['id']}"):
+                if st.button("Löschen", key=f"del_dep_{row['id']}"):
                     cur = conn.cursor()
                     cur.execute("DELETE FROM departures WHERE id = ?", (int(row["id"]),))
                     conn.commit()
                     st.success("Abfahrt gelöscht.")
                     st.rerun()
+
+
+# --------------------------------------------------
+# Admin-Ansicht: feste Touren (CRUD + Abfahrt erzeugen)
+# --------------------------------------------------
+
+def show_admin_tours(conn):
+    st.subheader("Feste Touren")
+
+    locations = load_locations(conn)
+    if locations.empty:
+        st.warning("Bitte zuerst Einrichtungen anlegen – Touren brauchen eine Einrichtung.")
+        return
+
+    tours = load_tours(conn)
+
+    st.write("Bestehende Touren:")
+    if tours.empty:
+        st.info("Noch keine Touren angelegt.")
+    else:
+        view = tours.copy()
+        view["Zeit"] = view["hour"].apply(lambda h: f"{int(h):02d}:00")
+        st.dataframe(
+            view[["id", "name", "weekday", "Zeit", "location_name", "note", "active"]],
+            use_container_width=True,
+        )
+
+    st.markdown("### Neue Tour anlegen")
+    with st.form("new_tour"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            tour_name = st.text_input("Tour-Name", "")
+            weekday = st.selectbox("Wochentag", WEEKDAYS_DE, key="tour_weekday_new")
+        with col2:
+            hours = [f"{h:02d}:00" for h in range(24)]
+            hour_label = st.selectbox("Uhrzeit (volle Stunde)", hours, index=8, key="tour_hour_new")
+            hour_int = int(hour_label.split(":")[0])
+        with col3:
+            loc_id = st.selectbox(
+                "Einrichtung",
+                options=locations["id"],
+                format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
+                key="tour_loc_new",
+            )
+
+        note = st.text_input("Hinweis (optional)", key="tour_note_new")
+        active = st.checkbox("Aktiv", value=True, key="tour_active_new")
+
+        submitted = st.form_submit_button("Tour speichern")
+        if submitted:
+            if not tour_name.strip():
+                st.error("Tour-Name darf nicht leer sein.")
+            else:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO tours (name, weekday, hour, location_id, note, active)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (tour_name.strip(), weekday, hour_int, int(loc_id), note.strip(), 1 if active else 0),
+                )
+                conn.commit()
+                st.success("Tour gespeichert.")
+                st.rerun()
+
+    # Tour bearbeiten / löschen / Abfahrt erzeugen
+    tours = load_tours(conn)
+    if tours.empty:
+        return
+
+    st.markdown("### Tour bearbeiten / Abfahrt erzeugen / löschen")
+    tour_ids = tours["id"].tolist()
+    selected = st.selectbox("Tour auswählen", tour_ids)
+    row = tours.loc[tours["id"] == selected].iloc[0]
+
+    with st.form("edit_tour"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            name_edit = st.text_input("Tour-Name", row["name"])
+            weekday_edit = st.selectbox(
+                "Wochentag", WEEKDAYS_DE,
+                index=WEEKDAYS_DE.index(row["weekday"]) if row["weekday"] in WEEKDAYS_DE else 0,
+                key="tour_weekday_edit",
+            )
+        with col2:
+            hours = [f"{h:02d}:00" for h in range(24)]
+            hour_edit_label = st.selectbox(
+                "Uhrzeit (volle Stunde)", hours,
+                index=int(row["hour"]) if 0 <= int(row["hour"]) < 24 else 8,
+                key="tour_hour_edit",
+            )
+            hour_edit = int(hour_edit_label.split(":")[0])
+        with col3:
+            loc_id_edit = st.selectbox(
+                "Einrichtung",
+                options=locations["id"],
+                format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
+                index=locations[locations["id"] == row["location_id"]].index[0],
+                key="tour_loc_edit",
+            )
+
+        note_edit = st.text_input("Hinweis (optional)", row["note"] or "", key="tour_note_edit")
+        active_edit = st.checkbox("Aktiv", value=bool(row["active"]), key="tour_active_edit")
+
+        col_btn1, col_btn2, col_btn3 = st.columns(3)
+        with col_btn1:
+            submitted_edit = st.form_submit_button("Änderungen speichern")
+        with col_btn2:
+            create_dep = st.form_submit_button("Abfahrt aus Tour anlegen")
+        with col_btn3:
+            delete_tour = st.form_submit_button("Tour löschen")
+
+        if submitted_edit:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE tours
+                SET name = ?, weekday = ?, hour = ?, location_id = ?, note = ?, active = ?
+                WHERE id = ?
+                """,
+                (name_edit.strip(), weekday_edit, hour_edit, int(loc_id_edit),
+                 note_edit.strip(), 1 if active_edit else 0, int(selected)),
+            )
+            conn.commit()
+            st.success("Tour aktualisiert.")
+            st.rerun()
+
+        if create_dep:
+            # Abfahrt aus Tour erzeugen
+            dt = next_datetime_for_weekday_hour(weekday_edit, hour_edit)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO departures (datetime, location_id, vehicle, status, note)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (dt.isoformat(), int(loc_id_edit), "", "GEPLANT", note_edit.strip()),
+            )
+            conn.commit()
+            st.success(f"Abfahrt aus Tour erzeugt (nächster Termin: {dt.strftime('%Y-%m-%d %H:%M')}).")
+            st.rerun()
+
+        if delete_tour:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM tours WHERE id = ?", (int(selected),))
+            conn.commit()
+            st.success("Tour gelöscht.")
+            st.rerun()
 
 
 # --------------------------------------------------
@@ -607,13 +808,15 @@ def show_admin_mode():
 
     conn = get_connection()
 
-    tabs = st.tabs(["Abfahrten", "Einrichtungen", "Screens"])
+    tabs = st.tabs(["Abfahrten", "Einrichtungen", "Screens", "Touren"])
     with tabs[0]:
         show_admin_departures(conn)
     with tabs[1]:
         show_admin_locations(conn)
     with tabs[2]:
         show_admin_screens(conn)
+    with tabs[3]:
+        show_admin_tours(conn)
 
 
 # --------------------------------------------------
