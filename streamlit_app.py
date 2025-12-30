@@ -320,9 +320,11 @@ def escape_html(text: str) -> str:
 
 
 def show_display_mode(screen_id: int):
-    """Anzeige für einen Monitor-Client (Display) mit Autorefresh, großer Schrift, Bannern & Laufband."""
+    """Anzeige für einen Monitor-Client (Display) mit Autorefresh, großer Schrift
+    und Sonderbild für Feiertagsbelieferung / Sonderplan.
+    """
 
-    # Menü & Footer ausblenden + große Schrift und Tabellendesign + Ticker-Styling
+    # Basis-CSS (Tabellen, große Schrift, Ticker-Styling)
     display_style = """
     <style>
     #MainMenu {visibility: hidden;}
@@ -348,15 +350,6 @@ def show_display_mode(screen_id: int):
     }
     .big-table th {
         font-weight: 700;
-    }
-
-    .screen-banner {
-        text-align: center;
-        font-size: 48px;
-        font-weight: 800;
-        margin: 0.5em 0 0.3em 0;
-        color: #ffffff;
-        text-transform: uppercase;
     }
 
     /* Laufband / Ticker */
@@ -405,21 +398,60 @@ def show_display_mode(screen_id: int):
         st.error(f"Screen {screen_id} ist nicht konfiguriert.")
         return
 
+    # Prüfen, ob Sonderplan/Feiertag aktiv ist
+    holiday_active = bool(screen.get("holiday_flag", 0)) if "holiday_flag" in screen.index else False
+    special_active = bool(screen.get("special_flag", 0)) if "special_flag" in screen.index else False
+
+    # Wenn einer der Haken aktiv ist -> Vollbild Schwarzer Hintergrund + weiße Schrift, sonst normale Ansicht
+    if holiday_active or special_active:
+        # Hintergrund komplett schwarz + Text weiß
+        st.markdown(
+            """
+            <style>
+            body, .block-container {
+                background-color: #000000 !important;
+                color: #ffffff !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Text bestimmen
+        parts = []
+        if holiday_active:
+            parts.append("Feiertagsbelieferung")
+        if special_active:
+            parts.append("Sonderplan")
+        message = " - ".join(p.upper() for p in parts)
+
+        # Vollbild-Text
+        st.markdown(
+            f"""
+            <div style="
+                display:flex;
+                justify-content:center;
+                align-items:center;
+                height:100vh;
+                width:100%;
+                background-color:#000000;
+                color:#ffffff;
+                font-size:72px;
+                font-weight:900;
+                text-transform:uppercase;
+                text-align:center;
+            ">
+                {message}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        # WICHTIG: Keine Tabelle und kein Laufband mehr anzeigen
+        return
+
+    # Normale Ansicht (wenn KEIN Sonderplan/Feiertagsbelieferung aktiv ist)
     st.markdown(f"## {screen['name']} (Screen {screen_id})")
     st.caption(f"Modus: {screen['mode']} • Aktualisierung alle {interval_sec} Sekunden")
-
-    # Banner für Feiertagsbelieferung / Sonderplan (nur Screens 1–4)
-    if screen["id"] in [1, 2, 3, 4]:
-        banner_lines = []
-        if "holiday_flag" in screen.index and screen["holiday_flag"]:
-            banner_lines.append("Feiertagsbelieferung")
-        if "special_flag" in screen.index and screen["special_flag"]:
-            banner_lines.append("Sonderplan")
-        if banner_lines:
-            st.markdown(
-                "<div class='screen-banner'>" + " · ".join(line.upper() for line in banner_lines) + "</div>",
-                unsafe_allow_html=True,
-            )
 
     if data is None or data.empty:
         st.info("Keine Abfahrten.")
@@ -434,7 +466,7 @@ def show_display_mode(screen_id: int):
             render_big_table(headers, rows, row_colors=row_colors)
 
         elif screen["mode"] == "DETAIL":
-            # (Optional) Standard-Detail-Ansicht für andere Detail-Screens
+            # Standard-Detail-Ansicht für andere Detail-Screens
             subset = data[["location_name", "location_type", "vehicle", "status", "note", "location_color"]].copy()
             subset["location_color"] = subset["location_color"].fillna("")
             headers = ["Einrichtung", "Typ", "Fahrzeug", "Status", "Hinweis"]
@@ -467,7 +499,7 @@ def show_display_mode(screen_id: int):
 
                             st.markdown(f"<div style='{style_str}'>{txt}</div>", unsafe_allow_html=True)
 
-    # Laufband / Ticker (für alle Screens 1–6)
+    # Laufband / Ticker (nur in Normalmodus)
     ticker_row = load_ticker(conn)
     if ticker_row is not None and ticker_row["active"] and (ticker_row["text"] or "").strip():
         text = escape_html(ticker_row["text"].strip())
