@@ -4,6 +4,8 @@ import sqlite3
 from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 
+from streamlit_autorefresh import st_autorefresh  # für Autorefresh
+
 # --------------------------------------------------
 # Grundeinstellungen
 # --------------------------------------------------
@@ -64,7 +66,7 @@ def init_db(conn: sqlite3.Connection):
     """Lege Tabellen an und füge Standard-Screens ein, falls noch nicht vorhanden."""
     cur = conn.cursor()
 
-    # Tabelle: Einrichtungen
+    # Tabelle: Einrichtungen (mit color)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS locations (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,6 +75,11 @@ def init_db(conn: sqlite3.Connection):
             active      INTEGER NOT NULL DEFAULT 1
         )
     """)
+    # Falls color-Spalte noch nicht existiert -> hinzufügen
+    cur.execute("PRAGMA table_info(locations)")
+    cols = [row[1] for row in cur.fetchall()]
+    if "color" not in cols:
+        cur.execute("ALTER TABLE locations ADD COLUMN color TEXT")
 
     # Tabelle: Abfahrten
     cur.execute("""
@@ -128,11 +135,12 @@ def read_df(conn: sqlite3.Connection, query: str, params=()):
 
 
 def load_locations(conn):
-    return read_df(conn, "SELECT id, name, type, active FROM locations ORDER BY id")
+    # color mit auslesen
+    return read_df(conn, "SELECT id, name, type, active, color FROM locations ORDER BY id")
 
 
 def load_departures_with_locations(conn):
-    """Abfahrten inkl. Einrichtungsnamen/-typ."""
+    """Abfahrten inkl. Einrichtungsnamen/-typ + Farbe."""
     df = read_df(conn, """
         SELECT d.id,
                d.datetime,
@@ -140,9 +148,10 @@ def load_departures_with_locations(conn):
                d.vehicle,
                d.status,
                d.note,
-               l.name AS location_name,
-               l.type AS location_type,
-               l.active AS location_active
+               l.name  AS location_name,
+               l.type  AS location_type,
+               l.active AS location_active,
+               l.color AS location_color
         FROM departures d
         JOIN locations l ON d.location_id = l.id
     """)
@@ -193,7 +202,8 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
     now = datetime.now()
 
     if deps.empty:
-        return screen, pd.DataFrame(columns=["datetime", "location_name", "location_type", "vehicle", "status", "note"])
+        return screen, pd.DataFrame(columns=["datetime", "location_name", "location_type",
+                                             "vehicle", "status", "note", "location_color"])
 
     future = deps[deps["datetime"] >= now].copy()
 
@@ -215,18 +225,64 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
     return screen, future
 
 
-def show_display_mode(screen_id: int):
-    """Anzeige für einen Monitor-Client (Display)."""
+def render_big_table(headers, rows, row_colors=None):
+    """Hilfsfunktion: große HTML-Tabelle für Monitore, optional mit Zeilenfarben."""
+    thead_cells = "".join(f"<th>{h}</th>" for h in headers)
+    body_rows = ""
 
-    # Streamlit-Menü & Footer ausblenden
-    hide_style = """
+    rows = list(rows)  # Iterator in Liste umwandeln, um idx zu haben
+
+    for idx, r in enumerate(rows):
+        style = ""
+        if row_colors is not None and idx < len(row_colors):
+            color = row_colors[idx] or ""
+            if color:
+                style = f' style="background-color: {color};"'
+        tds = "".join(f"<td>{c}</td>" for c in r)
+        body_rows += f"<tr{style}>{tds}</tr>"
+
+    table_html = f"""
+    <table class="big-table">
+      <thead><tr>{thead_cells}</tr></thead>
+      <tbody>{body_rows}</tbody>
+    </table>
+    """
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
+def show_display_mode(screen_id: int):
+    """Anzeige für einen Monitor-Client (Display) mit Autorefresh & großer Schrift."""
+
+    # Menü & Footer ausblenden + große Schrift und Tabellendesign
+    display_style = """
     <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
+
+    .block-container {
+        padding-top: 0.5rem;
+    }
+
+    body, .block-container, .stMarkdown, .stText, .stDataFrame, div, span {
+        font-size: 32px !important;
+    }
+
+    .big-table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    .big-table th, .big-table td {
+        border-bottom: 1px solid #555;
+        padding: 0.4em 0.8em;
+        text-align: left;
+    }
+    .big-table th {
+        font-weight: 700;
+    }
     </style>
     """
-    st.markdown(hide_style, unsafe_allow_html=True)
+    st.markdown(display_style, unsafe_allow_html=True)
 
     if not screen_id:
         st.error("Parameter 'screenId' fehlt oder ist ungültig.")
@@ -235,40 +291,47 @@ def show_display_mode(screen_id: int):
     conn = get_connection()
     screen, data = get_screen_data(conn, screen_id)
 
+    # Autorefresh aktivieren (Intervall aus Screen-Konfiguration)
+    interval_sec = 30
+    if screen is not None and "refresh_interval_seconds" in screen.index:
+        try:
+            interval_sec = int(screen["refresh_interval_seconds"])
+        except Exception:
+            interval_sec = 30
+
+    st_autorefresh(interval=interval_sec * 1000, key=f"display_refresh_{screen_id}")
+
     if screen is None:
         st.error(f"Screen {screen_id} ist nicht konfiguriert.")
         return
 
     st.markdown(f"## {screen['name']} (Screen {screen_id})")
-    st.caption(f"Modus: {screen['mode']} • Letzte Aktualisierung: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption(f"Modus: {screen['mode']} • Aktualisierung alle {interval_sec} Sekunden")
 
     if data is None or data.empty:
         st.info("Keine Abfahrten.")
         return
 
-    # Monitore 1–4: keine Typen, Fahrzeuge oder Status – nur Einrichtung + Hinweis
+    # Monitore 1–4: keine Typen, Fahrzeuge oder Status – nur Einrichtung + Hinweis, farbige Zeilen
     if screen["mode"] == "DETAIL" and screen["id"] in [1, 2, 3, 4]:
-        view = data[["location_name", "note"]].copy()
-        view = view.rename(columns={
-            "location_name": "Einrichtung",
-            "note": "Hinweis",
-        })
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        subset = data[["location_name", "note", "location_color"]].copy()
+        subset["location_color"] = subset["location_color"].fillna("")
+        headers = ["Einrichtung", "Hinweis"]
+        rows = subset[["location_name", "note"]].itertuples(index=False, name=None)
+        row_colors = subset["location_color"].tolist()
+        render_big_table(headers, rows, row_colors=row_colors)
 
     elif screen["mode"] == "DETAIL":
-        # Standard-Detail-Ansicht (falls später weitere Detail-Screens kommen)
-        view = data[["location_name", "location_type", "vehicle", "status", "note"]].copy()
-        view = view.rename(columns={
-            "location_name": "Einrichtung",
-            "location_type": "Typ",
-            "vehicle": "Fahrzeug",
-            "status": "Status",
-            "note": "Hinweis",
-        })
-        st.dataframe(view, use_container_width=True, hide_index=True)
+        # (Optional) Standard-Detail-Ansicht für andere Detail-Screens
+        subset = data[["location_name", "location_type", "vehicle", "status", "note", "location_color"]].copy()
+        subset["location_color"] = subset["location_color"].fillna("")
+        headers = ["Einrichtung", "Typ", "Fahrzeug", "Status", "Hinweis"]
+        rows = subset[["location_name", "location_type", "vehicle", "status", "note"]].itertuples(index=False, name=None)
+        row_colors = subset["location_color"].tolist()
+        render_big_table(headers, rows, row_colors=row_colors)
 
     else:
-        # OVERVIEW: nach Typ gruppieren, max. 3 Spalten, ohne Uhrzeit
+        # OVERVIEW: nach Typ gruppieren, Einträge farbig hinterlegt
         grouped = list(data.groupby("location_type"))
         if not grouped:
             st.info("Keine Daten für Übersicht.")
@@ -284,8 +347,14 @@ def show_display_mode(screen_id: int):
                     if row.get("vehicle"):
                         txt += f" · {row['vehicle']}"
                     if row.get("note"):
-                        txt += f"<br/><span style='font-size:14px;color:#ccc;'>{row['note']}</span>"
-                    st.markdown(f"<div style='margin-bottom:10px;'>{txt}</div>", unsafe_allow_html=True)
+                        txt += f"<br/><span style='font-size:28px;color:#ccc;'>{row['note']}</span>"
+
+                    color = row.get("location_color") or ""
+                    style_str = "margin-bottom:10px;"
+                    if color:
+                        style_str += f"background-color:{color};padding:0.3em 0.5em;border-radius:0.2em;"
+
+                    st.markdown(f"<div style='{style_str}'>{txt}</div>", unsafe_allow_html=True)
 
 
 # --------------------------------------------------
@@ -305,12 +374,14 @@ def show_admin_locations(conn):
 
     st.markdown("### Neue Einrichtung anlegen")
     with st.form("new_location"):
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             name = st.text_input("Name", "")
             typ = st.selectbox("Typ", ["KRANKENHAUS", "ALTENHEIM", "MVZ"])
         with col2:
             active = st.checkbox("Aktiv", value=True)
+        with col3:
+            color = st.color_picker("Farbe", "#007bff")
 
         submitted = st.form_submit_button("Speichern")
         if submitted:
@@ -319,11 +390,42 @@ def show_admin_locations(conn):
             else:
                 cur = conn.cursor()
                 cur.execute(
-                    "INSERT INTO locations (name, type, active) VALUES (?, ?, ?)",
-                    (name.strip(), typ, 1 if active else 0),
+                    "INSERT INTO locations (name, type, active, color) VALUES (?, ?, ?, ?)",
+                    (name.strip(), typ, 1 if active else 0, color),
                 )
                 conn.commit()
                 st.success("Einrichtung gespeichert.")
+                st.rerun()
+
+    if not locations.empty:
+        st.markdown("### Einrichtung bearbeiten")
+        loc_ids = locations["id"].tolist()
+        selected = st.selectbox("Einrichtung auswählen", loc_ids)
+        row = locations.loc[locations["id"] == selected].iloc[0]
+
+        with st.form("edit_location"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                name_edit = st.text_input("Name", row["name"])
+                typ_edit = st.selectbox(
+                    "Typ", ["KRANKENHAUS", "ALTENHEIM", "MVZ"],
+                    index=["KRANKENHAUS", "ALTENHEIM", "MVZ"].index(row["type"])
+                )
+            with col2:
+                active_edit = st.checkbox("Aktiv", value=bool(row["active"]))
+            with col3:
+                color_init = row["color"] if isinstance(row["color"], str) and row["color"] else "#007bff"
+                color_edit = st.color_picker("Farbe", color_init)
+
+            submitted_edit = st.form_submit_button("Änderungen speichern")
+            if submitted_edit:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE locations SET name = ?, type = ?, active = ?, color = ? WHERE id = ?",
+                    (name_edit.strip(), typ_edit, 1 if active_edit else 0, color_edit, int(selected)),
+                )
+                conn.commit()
+                st.success("Einrichtung aktualisiert.")
                 st.rerun()
 
 
