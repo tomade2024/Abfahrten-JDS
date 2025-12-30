@@ -8,6 +8,14 @@ st.set_page_config(page_title="Abfahrten", layout="wide")
 
 DB_PATH = Path("abfahrten.db")
 
+def do_rerun():
+    # Für neue Streamlit-Versionen
+    if hasattr(st, "rerun"):
+        st.rerun()
+    # Fallback für ältere Versionen
+    elif hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+
 # --------------------------------------------------
 # DB-Helfer
 # --------------------------------------------------
