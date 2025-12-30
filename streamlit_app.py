@@ -659,6 +659,8 @@ def show_admin_departures(conn, can_edit: bool):
             # Rechte Seite: Löschbutton nur für admin
             with col2:
                 if can_edit:
+                    if st.form_submit_button  and False:
+                        pass  # Dummy, um Linter zu beruhigen
                     if st.button("Löschen", key=f"del_dep_{row['id']}"):
                         cur = conn.cursor()
                         cur.execute("DELETE FROM departures WHERE id = ?", (int(row["id"]),))
@@ -670,7 +672,7 @@ def show_admin_departures(conn, can_edit: bool):
 
 
 # --------------------------------------------------
-# Admin-Ansicht: feste Touren (CRUD + Abfahrt erzeugen, je nach Rolle)
+# Admin-Ansicht: feste Touren (ohne st.form, robust)
 # --------------------------------------------------
 
 def show_admin_tours(conn, can_edit: bool):
@@ -681,6 +683,7 @@ def show_admin_tours(conn, can_edit: bool):
         st.warning("Bitte zuerst Einrichtungen anlegen – Touren brauchen eine Einrichtung.")
         return
 
+    # --- Übersicht aller Touren ---
     tours = load_tours(conn)
 
     st.write("Bestehende Touren:")
@@ -694,96 +697,112 @@ def show_admin_tours(conn, can_edit: bool):
             use_container_width=True,
         )
 
+    # dispo (viewer) darf nur sehen
     if not can_edit:
-        # Nur Anzeige für den dispo-User
         return
 
+    # --- Neue Tour anlegen (ohne st.form) ---
     st.markdown("### Neue Tour anlegen")
-    with st.form("new_tour"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            tour_name = st.text_input("Tour-Name", "")
-            weekday = st.selectbox("Wochentag", WEEKDAYS_DE, key="tour_weekday_new")
-        with col2:
-            hours = [f"{h:02d}:00" for h in range(24)]
-            hour_label = st.selectbox("Uhrzeit (volle Stunde)", hours, index=8, key="tour_hour_new")
-            hour_int = int(hour_label.split(":")[0])
-        with col3:
-            loc_id = st.selectbox(
-                "Einrichtung",
-                options=locations["id"],
-                format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
-                key="tour_loc_new",
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        tour_name = st.text_input("Tour-Name", "", key="new_tour_name")
+        weekday = st.selectbox("Wochentag", WEEKDAYS_DE, key="new_tour_weekday")
+    with col2:
+        hours = [f"{h:02d}:00" for h in range(24)]
+        hour_label = st.selectbox("Uhrzeit (volle Stunde)", hours, index=8, key="new_tour_hour")
+        hour_int = int(hour_label.split(":")[0])
+    with col3:
+        loc_options = list(locations["id"])
+        loc_id = st.selectbox(
+            "Einrichtung",
+            options=loc_options,
+            format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
+            key="new_tour_location",
+        )
+
+    note_new = st.text_input("Hinweis (optional)", "", key="new_tour_note")
+    active_new = st.checkbox("Aktiv", value=True, key="new_tour_active")
+
+    if st.button("Tour speichern", key="btn_new_tour_save"):
+        if not tour_name.strip():
+            st.error("Tour-Name darf nicht leer sein.")
+        else:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO tours (name, weekday, hour, location_id, note, active)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (tour_name.strip(), weekday, hour_int, int(loc_id), note_new.strip(), 1 if active_new else 0),
             )
+            conn.commit()
+            st.success("Tour gespeichert.")
+            st.rerun()
 
-        note = st.text_input("Hinweis (optional)", key="tour_note_new")
-        active = st.checkbox("Aktiv", value=True, key="tour_active_new")
-
-        submitted = st.form_submit_button("Tour speichern")
-        if submitted:
-            if not tour_name.strip():
-                st.error("Tour-Name darf nicht leer sein.")
-            else:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO tours (name, weekday, hour, location_id, note, active)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (tour_name.strip(), weekday, hour_int, int(loc_id), note.strip(), 1 if active else 0),
-                )
-                conn.commit()
-                st.success("Tour gespeichert.")
-                st.rerun()
-
-    # Tour bearbeiten / löschen / Abfahrt erzeugen
+    # --- Bestehende Tour bearbeiten / löschen / Abfahrt erzeugen ---
     tours = load_tours(conn)
     if tours.empty:
         return
 
     st.markdown("### Tour bearbeiten / Abfahrt erzeugen / löschen")
+
     tour_ids = tours["id"].tolist()
-    selected = st.selectbox("Tour auswählen", tour_ids)
+    selected = st.selectbox("Tour auswählen", tour_ids, key="edit_tour_select")
     row = tours.loc[tours["id"] == selected].iloc[0]
 
-    with st.form("edit_tour"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            name_edit = st.text_input("Tour-Name", row["name"])
-            weekday_edit = st.selectbox(
-                "Wochentag", WEEKDAYS_DE,
-                index=WEEKDAYS_DE.index(row["weekday"]) if row["weekday"] in WEEKDAYS_DE else 0,
-                key="tour_weekday_edit",
-            )
-        with col2:
-            hours = [f"{h:02d}:00" for h in range(24)]
-            hour_edit_label = st.selectbox(
-                "Uhrzeit (volle Stunde)", hours,
-                index=int(row["hour"]) if 0 <= int(row["hour"]) < 24 else 8,
-                key="tour_hour_edit",
-            )
-            hour_edit = int(hour_edit_label.split(":")[0])
-        with col3:
-            loc_id_edit = st.selectbox(
-                "Einrichtung",
-                options=locations["id"],
-                format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
-                index=locations[locations["id"] == row["location_id"]].index[0],
-                key="tour_loc_edit",
-            )
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        name_edit = st.text_input("Tour-Name", row["name"], key=f"edit_tour_name_{selected}")
+        weekday_edit = st.selectbox(
+            "Wochentag",
+            WEEKDAYS_DE,
+            index=WEEKDAYS_DE.index(row["weekday"]) if row["weekday"] in WEEKDAYS_DE else 0,
+            key=f"edit_tour_weekday_{selected}",
+        )
+    with col2:
+        hours = [f"{h:02d}:00" for h in range(24)]
+        try:
+            default_hour_index = int(row["hour"])
+            if not (0 <= default_hour_index < 24):
+                default_hour_index = 8
+        except Exception:
+            default_hour_index = 8
+        hour_edit_label = st.selectbox(
+            "Uhrzeit (volle Stunde)",
+            hours,
+            index=default_hour_index,
+            key=f"edit_tour_hour_{selected}",
+        )
+        hour_edit = int(hour_edit_label.split(":")[0])
+    with col3:
+        loc_options = list(locations["id"])
+        try:
+            default_loc_index = loc_options.index(row["location_id"])
+        except ValueError:
+            default_loc_index = 0
+        loc_id_edit = st.selectbox(
+            "Einrichtung",
+            options=loc_options,
+            format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
+            index=default_loc_index,
+            key=f"edit_tour_location_{selected}",
+        )
 
-        note_edit = st.text_input("Hinweis (optional)", row["note"] or "", key="tour_note_edit")
-        active_edit = st.checkbox("Aktiv", value=bool(row["active"]), key="tour_active_edit")
+    note_edit = st.text_input(
+        "Hinweis (optional)",
+        row["note"] or "",
+        key=f"edit_tour_note_{selected}",
+    )
+    active_edit = st.checkbox(
+        "Aktiv",
+        value=bool(row["active"]),
+        key=f"edit_tour_active_{selected}",
+    )
 
-        col_btn1, col_btn2, col_btn3 = st.columns(3)
-        with col_btn1:
-            submitted_edit = st.form_submit_button("Änderungen speichern")
-        with col_btn2:
-            create_dep = st.form_submit_button("Abfahrt aus Tour anlegen")
-        with col_btn3:
-            delete_tour = st.form_submit_button("Tour löschen")
-
-        if submitted_edit:
+    col_btn1, col_btn2, col_btn3 = st.columns(3)
+    with col_btn1:
+        if st.button("Änderungen speichern", key=f"btn_edit_tour_save_{selected}"):
             cur = conn.cursor()
             cur.execute(
                 """
@@ -798,8 +817,8 @@ def show_admin_tours(conn, can_edit: bool):
             st.success("Tour aktualisiert.")
             st.rerun()
 
-        if create_dep:
-            # Abfahrt aus Tour erzeugen
+    with col_btn2:
+        if st.button("Abfahrt aus Tour anlegen", key=f"btn_edit_tour_create_dep_{selected}"):
             dt = next_datetime_for_weekday_hour(weekday_edit, hour_edit)
             cur = conn.cursor()
             cur.execute(
@@ -813,7 +832,8 @@ def show_admin_tours(conn, can_edit: bool):
             st.success(f"Abfahrt aus Tour erzeugt (nächster Termin: {dt.strftime('%Y-%m-%d %H:%M')}).")
             st.rerun()
 
-        if delete_tour:
+    with col_btn3:
+        if st.button("Tour löschen", key=f"btn_edit_tour_delete_{selected}"):
             cur = conn.cursor()
             cur.execute("DELETE FROM tours WHERE id = ?", (int(selected),))
             conn.commit()
