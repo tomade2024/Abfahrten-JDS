@@ -13,9 +13,12 @@ from streamlit_autorefresh import st_autorefresh  # für Autorefresh
 st.set_page_config(page_title="Abfahrten", layout="wide")
 DB_PATH = Path("abfahrten.db")
 
-# Einfache Login-Daten (BITTE anpassen!)
+# Benutzer + Rollen
+# admin  -> volle Rechte
+# dispo  -> nur Abfahrten/Touren sehen, nichts bearbeiten/löschen
 USERS = {
-    "admin": "admin123",  # Benutzername: admin, Passwort: admin123
+    "admin": {"password": "admin123", "role": "admin"},
+    "dispo": {"password": "dispo123", "role": "viewer"},
 }
 
 WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
@@ -27,7 +30,7 @@ WEEKDAY_TO_INT = {name: i for i, name in enumerate(WEEKDAYS_DE)}  # Montag = 0, 
 # --------------------------------------------------
 
 def require_login():
-    """Einfacher Login-Schutz für den Admin-Bereich."""
+    """Einfacher Login-Schutz für den Admin-Bereich mit Rollen."""
     if st.session_state.get("logged_in"):
         return
 
@@ -39,8 +42,11 @@ def require_login():
         submitted = st.form_submit_button("Einloggen")
 
         if submitted:
-            if username in USERS and USERS[username] == password:
+            user_entry = USERS.get(username)
+            if user_entry and user_entry["password"] == password:
                 st.session_state["logged_in"] = True
+                st.session_state["role"] = user_entry["role"]
+                st.session_state["username"] = username
                 st.success("Erfolgreich eingeloggt.")
                 st.rerun()
             else:
@@ -119,22 +125,42 @@ def init_db(conn: sqlite3.Connection):
             refresh_interval_seconds  INTEGER NOT NULL DEFAULT 30
         )
     """)
+    # Zusatzspalten für Feiertag/Sonderplan
+    cur.execute("PRAGMA table_info(screens)")
+    s_cols = [row[1] for row in cur.fetchall()]
+    if "holiday_flag" not in s_cols:
+        cur.execute("ALTER TABLE screens ADD COLUMN holiday_flag INTEGER NOT NULL DEFAULT 0")
+    if "special_flag" not in s_cols:
+        cur.execute("ALTER TABLE screens ADD COLUMN special_flag INTEGER NOT NULL DEFAULT 0")
+
+    # Tabelle: Laufband/Ticker
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ticker (
+            id     INTEGER PRIMARY KEY,
+            text   TEXT,
+            active INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    cur.execute("SELECT COUNT(*) FROM ticker")
+    if cur.fetchone()[0] == 0:
+        cur.execute("INSERT INTO ticker (id, text, active) VALUES (1, '', 0)")
 
     # Standard-Screens anlegen, falls noch keine vorhanden sind
     cur.execute("SELECT COUNT(*) AS cnt FROM screens")
     cnt = cur.fetchone()["cnt"]
     if cnt == 0:
         screens = [
-            (1, "Zone A",           "DETAIL",   "KRANKENHAUS", "", 15),
-            (2, "Zone B",           "DETAIL",   "KRANKENHAUS", "", 15),
-            (3, "Zone C",           "DETAIL",   "ALTENHEIM",   "", 15),
-            (4, "Zone D",           "DETAIL",   "MVZ",         "", 15),
-            (5, "Übersicht Links",  "OVERVIEW", "ALLE",        "", 20),
-            (6, "Übersicht Rechts", "OVERVIEW", "ALLE",        "", 20),
+            (1, "Zone A",           "DETAIL",   "KRANKENHAUS", "", 15, 0, 0),
+            (2, "Zone B",           "DETAIL",   "KRANKENHAUS", "", 15, 0, 0),
+            (3, "Zone C",           "DETAIL",   "ALTENHEIM",   "", 15, 0, 0),
+            (4, "Zone D",           "DETAIL",   "MVZ",         "", 15, 0, 0),
+            (5, "Übersicht Links",  "OVERVIEW", "ALLE",        "", 20, 0, 0),
+            (6, "Übersicht Rechts", "OVERVIEW", "ALLE",        "", 20, 0, 0),
         ]
         cur.executemany("""
-            INSERT INTO screens (id, name, mode, filter_type, filter_locations, refresh_interval_seconds)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO screens
+                (id, name, mode, filter_type, filter_locations, refresh_interval_seconds, holiday_flag, special_flag)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, screens)
 
     conn.commit()
@@ -191,6 +217,11 @@ def load_tours(conn):
         JOIN locations l ON t.location_id = l.id
         ORDER BY t.id
     """)
+
+
+def load_ticker(conn):
+    df = read_df(conn, "SELECT * FROM ticker WHERE id = 1")
+    return df.iloc[0] if not df.empty else None
 
 
 # --------------------------------------------------
@@ -279,10 +310,19 @@ def render_big_table(headers, rows, row_colors=None):
     st.markdown(table_html, unsafe_allow_html=True)
 
 
-def show_display_mode(screen_id: int):
-    """Anzeige für einen Monitor-Client (Display) mit Autorefresh & großer Schrift."""
+def escape_html(text: str) -> str:
+    """Einfache HTML-Escaping-Funktion für den Ticker-Text."""
+    return (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+    )
 
-    # Menü & Footer ausblenden + große Schrift und Tabellendesign
+
+def show_display_mode(screen_id: int):
+    """Anzeige für einen Monitor-Client (Display) mit Autorefresh, großer Schrift, Bannern & Laufband."""
+
+    # Menü & Footer ausblenden + große Schrift und Tabellendesign + Ticker-Styling
     display_style = """
     <style>
     #MainMenu {visibility: hidden;}
@@ -308,6 +348,37 @@ def show_display_mode(screen_id: int):
     }
     .big-table th {
         font-weight: 700;
+    }
+
+    .screen-banner {
+        text-align: center;
+        font-size: 48px;
+        font-weight: 800;
+        margin: 0.5em 0 0.3em 0;
+        color: #ffffff;
+        text-transform: uppercase;
+    }
+
+    /* Laufband / Ticker */
+    .ticker {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        width: 100%;
+        background: #000;
+        color: #fff;
+        overflow: hidden;
+        white-space: nowrap;
+        z-index: 9999;
+    }
+    .ticker__inner {
+        display: inline-block;
+        padding-left: 100%;
+        animation: ticker-scroll 20s linear infinite;
+    }
+    @keyframes ticker-scroll {
+        0%   { transform: translateX(0); }
+        100% { transform: translateX(-100%); }
     }
     </style>
     """
@@ -337,53 +408,75 @@ def show_display_mode(screen_id: int):
     st.markdown(f"## {screen['name']} (Screen {screen_id})")
     st.caption(f"Modus: {screen['mode']} • Aktualisierung alle {interval_sec} Sekunden")
 
+    # Banner für Feiertagsbelieferung / Sonderplan (nur Screens 1–4)
+    if screen["id"] in [1, 2, 3, 4]:
+        banner_lines = []
+        if "holiday_flag" in screen.index and screen["holiday_flag"]:
+            banner_lines.append("Feiertagsbelieferung")
+        if "special_flag" in screen.index and screen["special_flag"]:
+            banner_lines.append("Sonderplan")
+        if banner_lines:
+            st.markdown(
+                "<div class='screen-banner'>" + " · ".join(line.upper() for line in banner_lines) + "</div>",
+                unsafe_allow_html=True,
+            )
+
     if data is None or data.empty:
         st.info("Keine Abfahrten.")
-        return
-
-    # Monitore 1–4: keine Typen, Fahrzeuge oder Status – nur Einrichtung + Hinweis, farbige Zeilen
-    if screen["mode"] == "DETAIL" and screen["id"] in [1, 2, 3, 4]:
-        subset = data[["location_name", "note", "location_color"]].copy()
-        subset["location_color"] = subset["location_color"].fillna("")
-        headers = ["Einrichtung", "Hinweis"]
-        rows = subset[["location_name", "note"]].itertuples(index=False, name=None)
-        row_colors = subset["location_color"].tolist()
-        render_big_table(headers, rows, row_colors=row_colors)
-
-    elif screen["mode"] == "DETAIL":
-        # (Optional) Standard-Detail-Ansicht für andere Detail-Screens
-        subset = data[["location_name", "location_type", "vehicle", "status", "note", "location_color"]].copy()
-        subset["location_color"] = subset["location_color"].fillna("")
-        headers = ["Einrichtung", "Typ", "Fahrzeug", "Status", "Hinweis"]
-        rows = subset[["location_name", "location_type", "vehicle", "status", "note"]].itertuples(index=False, name=None)
-        row_colors = subset["location_color"].tolist()
-        render_big_table(headers, rows, row_colors=row_colors)
-
     else:
-        # OVERVIEW: nach Typ gruppieren, Einträge farbig hinterlegt
-        grouped = list(data.groupby("location_type"))
-        if not grouped:
-            st.info("Keine Daten für Übersicht.")
-            return
+        # Monitore 1–4: keine Typen, Fahrzeuge oder Status – nur Einrichtung + Hinweis, farbige Zeilen
+        if screen["mode"] == "DETAIL" and screen["id"] in [1, 2, 3, 4]:
+            subset = data[["location_name", "note", "location_color"]].copy()
+            subset["location_color"] = subset["location_color"].fillna("")
+            headers = ["Einrichtung", "Hinweis"]
+            rows = subset[["location_name", "note"]].itertuples(index=False, name=None)
+            row_colors = subset["location_color"].tolist()
+            render_big_table(headers, rows, row_colors=row_colors)
 
-        cols = st.columns(3)
-        for idx, (typ, group) in enumerate(grouped):
-            col = cols[idx % 3]
-            with col:
-                st.markdown(f"### {typ}")
-                for _, row in group.head(5).iterrows():
-                    txt = f"**{row['location_name']}**"
-                    if row.get("vehicle"):
-                        txt += f" · {row['vehicle']}"
-                    if row.get("note"):
-                        txt += f"<br/><span style='font-size:28px;color:#ccc;'>{row['note']}</span>"
+        elif screen["mode"] == "DETAIL":
+            # (Optional) Standard-Detail-Ansicht für andere Detail-Screens
+            subset = data[["location_name", "location_type", "vehicle", "status", "note", "location_color"]].copy()
+            subset["location_color"] = subset["location_color"].fillna("")
+            headers = ["Einrichtung", "Typ", "Fahrzeug", "Status", "Hinweis"]
+            rows = subset[["location_name", "location_type", "vehicle", "status", "note"]].itertuples(index=False, name=None)
+            row_colors = subset["location_color"].tolist()
+            render_big_table(headers, rows, row_colors=row_colors)
 
-                    color = row.get("location_color") or ""
-                    style_str = "margin-bottom:10px;"
-                    if color:
-                        style_str += f"background-color:{color};padding:0.3em 0.5em;border-radius:0.2em;"
+        else:
+            # OVERVIEW: nach Typ gruppieren, Einträge farbig hinterlegt
+            grouped = list(data.groupby("location_type"))
+            if not grouped:
+                st.info("Keine Daten für Übersicht.")
+            else:
+                cols = st.columns(3)
+                for idx, (typ, group) in enumerate(grouped):
+                    col = cols[idx % 3]
+                    with col:
+                        st.markdown(f"### {typ}")
+                        for _, row in group.head(5).iterrows():
+                            txt = f"**{row['location_name']}**"
+                            if row.get("vehicle"):
+                                txt += f" · {row['vehicle']}"
+                            if row.get("note"):
+                                txt += f"<br/><span style='font-size:28px;color:#ccc;'>{row['note']}</span>"
 
-                    st.markdown(f"<div style='{style_str}'>{txt}</div>", unsafe_allow_html=True)
+                            color = row.get("location_color") or ""
+                            style_str = "margin-bottom:10px;"
+                            if color:
+                                style_str += f"background-color:{color};padding:0.3em 0.5em;border-radius:0.2em;"
+
+                            st.markdown(f"<div style='{style_str}'>{txt}</div>", unsafe_allow_html=True)
+
+    # Laufband / Ticker (für alle Screens 1–6)
+    ticker_row = load_ticker(conn)
+    if ticker_row is not None and ticker_row["active"] and (ticker_row["text"] or "").strip():
+        text = escape_html(ticker_row["text"].strip())
+        ticker_html = f"""
+        <div class="ticker">
+          <div class="ticker__inner">{text}</div>
+        </div>
+        """
+        st.markdown(ticker_html, unsafe_allow_html=True)
 
 
 # --------------------------------------------------
@@ -483,10 +576,10 @@ def show_admin_locations(conn):
 
 
 # --------------------------------------------------
-# Admin-Ansicht: Abfahrten (inkl. Löschen)
+# Admin-Ansicht: Abfahrten (mit/ohne Bearbeitung, je nach Rolle)
 # --------------------------------------------------
 
-def show_admin_departures(conn):
+def show_admin_departures(conn, can_edit: bool):
     st.subheader("Abfahrten")
 
     locations = load_locations(conn)
@@ -494,45 +587,46 @@ def show_admin_departures(conn):
         st.warning("Bitte zuerst mindestens eine Einrichtung anlegen.")
         return
 
-    # Neue Abfahrt anlegen – mit Wochentag + Stunde
-    st.markdown("### Neue Abfahrt anlegen")
+    if can_edit:
+        # Neue Abfahrt anlegen – mit Wochentag + Stunde
+        st.markdown("### Neue Abfahrt anlegen")
 
-    with st.form("new_departure"):
-        col1, col2, col3 = st.columns(3)
+        with st.form("new_departure"):
+            col1, col2, col3 = st.columns(3)
 
-        with col1:
-            weekday = st.selectbox("Wochentag", WEEKDAYS_DE)
-        with col2:
-            hours = [f"{h:02d}:00" for h in range(24)]
-            hour_label = st.selectbox("Uhrzeit (volle Stunde)", hours, index=8)  # Standard: 08:00
-            hour_int = int(hour_label.split(":")[0])
-        with col3:
-            loc_id = st.selectbox(
-                "Einrichtung",
-                options=locations["id"],
-                format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
-            )
+            with col1:
+                weekday = st.selectbox("Wochentag", WEEKDAYS_DE)
+            with col2:
+                hours = [f"{h:02d}:00" for h in range(24)]
+                hour_label = st.selectbox("Uhrzeit (volle Stunde)", hours, index=8)  # Standard: 08:00
+                hour_int = int(hour_label.split(":")[0])
+            with col3:
+                loc_id = st.selectbox(
+                    "Einrichtung",
+                    options=locations["id"],
+                    format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
+                )
 
-        vehicle = st.text_input("Fahrzeug (optional)", "")
-        status = st.selectbox("Status", ["GEPLANT", "UNTERWEGS", "ABGESCHLOSSEN", "STORNIERT"])
-        note = st.text_input("Hinweis (optional)", "")
+            vehicle = st.text_input("Fahrzeug (optional)", "")
+            status = st.selectbox("Status", ["GEPLANT", "UNTERWEGS", "ABGESCHLOSSEN", "STORNIERT"])
+            note = st.text_input("Hinweis (optional)", "")
 
-        submitted = st.form_submit_button("Speichern")
-        if submitted:
-            dt = next_datetime_for_weekday_hour(weekday, hour_int)
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO departures (datetime, location_id, vehicle, status, note)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (dt.isoformat(), int(loc_id), vehicle.strip(), status, note.strip()),
-            )
-            conn.commit()
-            st.success(f"Abfahrt gespeichert (nächster Termin: {dt.strftime('%Y-%m-%d %H:%M')}).")
-            st.rerun()
+            submitted = st.form_submit_button("Speichern")
+            if submitted:
+                dt = next_datetime_for_weekday_hour(weekday, hour_int)
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO departures (datetime, location_id, vehicle, status, note)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (dt.isoformat(), int(loc_id), vehicle.strip(), status, note.strip()),
+                )
+                conn.commit()
+                st.success(f"Abfahrt gespeichert (nächster Termin: {dt.strftime('%Y-%m-%d %H:%M')}).")
+                st.rerun()
 
-    # Bestehende Abfahrten anzeigen + Löschbutton
+    # Bestehende Abfahrten anzeigen
     st.markdown("### Bestehende Abfahrten")
 
     deps = load_departures_with_locations(conn)
@@ -562,21 +656,24 @@ def show_admin_departures(conn):
                 if info:
                     st.markdown("<br>".join(info), unsafe_allow_html=True)
 
-            # Rechte Seite: Löschbutton
+            # Rechte Seite: Löschbutton nur für admin
             with col2:
-                if st.button("Löschen", key=f"del_dep_{row['id']}"):
-                    cur = conn.cursor()
-                    cur.execute("DELETE FROM departures WHERE id = ?", (int(row["id"]),))
-                    conn.commit()
-                    st.success("Abfahrt gelöscht.")
-                    st.rerun()
+                if can_edit:
+                    if st.button("Löschen", key=f"del_dep_{row['id']}"):
+                        cur = conn.cursor()
+                        cur.execute("DELETE FROM departures WHERE id = ?", (int(row["id"]),))
+                        conn.commit()
+                        st.success("Abfahrt gelöscht.")
+                        st.rerun()
+                else:
+                    st.caption("Keine Löschrechte")
 
 
 # --------------------------------------------------
-# Admin-Ansicht: feste Touren (CRUD + Abfahrt erzeugen)
+# Admin-Ansicht: feste Touren (CRUD + Abfahrt erzeugen, je nach Rolle)
 # --------------------------------------------------
 
-def show_admin_tours(conn):
+def show_admin_tours(conn, can_edit: bool):
     st.subheader("Feste Touren")
 
     locations = load_locations(conn)
@@ -596,6 +693,10 @@ def show_admin_tours(conn):
             view[["id", "name", "weekday", "Zeit", "location_name", "note", "active"]],
             use_container_width=True,
         )
+
+    if not can_edit:
+        # Nur Anzeige für den dispo-User
+        return
 
     st.markdown("### Neue Tour anlegen")
     with st.form("new_tour"):
@@ -721,7 +822,7 @@ def show_admin_tours(conn):
 
 
 # --------------------------------------------------
-# Admin-Ansicht: Screens (inkl. Links zu Monitoren)
+# Admin-Ansicht: Screens (inkl. Links, Feiertag/Sonderplan, Laufband)
 # --------------------------------------------------
 
 def show_admin_screens(conn):
@@ -778,17 +879,47 @@ def show_admin_screens(conn):
             min_value=5, max_value=300,
             value=int(row["refresh_interval_seconds"]),
         )
+        holiday_flag = st.checkbox(
+            "Feiertagsbelieferung aktiv",
+            value=bool(row.get("holiday_flag", 0))
+        )
+        special_flag = st.checkbox(
+            "Sonderplan aktiv",
+            value=bool(row.get("special_flag", 0))
+        )
 
         submitted = st.form_submit_button("Speichern")
         if submitted:
             cur = conn.cursor()
             cur.execute("""
                 UPDATE screens
-                SET name = ?, mode = ?, filter_type = ?, filter_locations = ?, refresh_interval_seconds = ?
+                SET name = ?, mode = ?, filter_type = ?, filter_locations = ?,
+                    refresh_interval_seconds = ?, holiday_flag = ?, special_flag = ?
                 WHERE id = ?
-            """, (name, mode, filter_type, filter_locations, int(refresh), int(selected)))
+            """, (name, mode, filter_type, filter_locations,
+                  int(refresh), 1 if holiday_flag else 0, 1 if special_flag else 0, int(selected)))
             conn.commit()
             st.success("Screen aktualisiert.")
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("### Laufband / Ticker")
+
+    ticker_row = load_ticker(conn)
+    if ticker_row is None:
+        st.error("Ticker-Datensatz fehlt.")
+        return
+
+    with st.form("ticker_form"):
+        text = st.text_area("Laufband-Text", value=ticker_row["text"] or "", height=100)
+        active = st.checkbox("Laufband aktiv", value=bool(ticker_row["active"]))
+        submitted_ticker = st.form_submit_button("Laufband speichern")
+        if submitted_ticker:
+            cur = conn.cursor()
+            cur.execute("UPDATE ticker SET text = ?, active = ? WHERE id = 1",
+                        (text.strip(), 1 if active else 0))
+            conn.commit()
+            st.success("Laufband aktualisiert.")
             st.rerun()
 
 
@@ -799,24 +930,39 @@ def show_admin_screens(conn):
 def show_admin_mode():
     require_login()  # Login erzwingen
 
+    role = st.session_state.get("role", "viewer")
+    username = st.session_state.get("username", "")
+
     st.title("Abfahrten – Admin / Disposition")
+    st.caption(f"Eingeloggt als: {username} (Rolle: {role})")
 
     # Logout-Button
     if st.sidebar.button("Logout"):
         st.session_state["logged_in"] = False
+        st.session_state["role"] = None
+        st.session_state["username"] = None
         st.rerun()
 
     conn = get_connection()
+    can_edit = (role == "admin")
 
-    tabs = st.tabs(["Abfahrten", "Einrichtungen", "Screens", "Touren"])
-    with tabs[0]:
-        show_admin_departures(conn)
-    with tabs[1]:
-        show_admin_locations(conn)
-    with tabs[2]:
-        show_admin_screens(conn)
-    with tabs[3]:
-        show_admin_tours(conn)
+    if role == "admin":
+        tabs = st.tabs(["Abfahrten", "Einrichtungen", "Screens", "Touren"])
+        with tabs[0]:
+            show_admin_departures(conn, can_edit=True)
+        with tabs[1]:
+            show_admin_locations(conn)
+        with tabs[2]:
+            show_admin_screens(conn)
+        with tabs[3]:
+            show_admin_tours(conn, can_edit=True)
+    else:
+        # dispo: nur Abfahrten & Touren, ohne Bearbeiten/Löschen
+        tabs = st.tabs(["Abfahrten", "Touren"])
+        with tabs[0]:
+            show_admin_departures(conn, can_edit=False)
+        with tabs[1]:
+            show_admin_tours(conn, can_edit=False)
 
 
 # --------------------------------------------------
