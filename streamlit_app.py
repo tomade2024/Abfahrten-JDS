@@ -12,7 +12,7 @@ st.set_page_config(
     layout="wide",
 )
 
-EXCEL_PATH = Path("daten.xlsx")
+EXCEL_PATH = Path("daten.xls")
 
 
 # --------------------------------------------------
