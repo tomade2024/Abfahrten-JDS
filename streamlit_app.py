@@ -73,14 +73,16 @@ def init_db(conn: sqlite3.Connection):
     cur = conn.cursor()
 
     # Tabelle: Einrichtungen
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS locations (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             name        TEXT NOT NULL,
             type        TEXT NOT NULL,        -- KRANKENHAUS / ALTENHEIM / MVZ
             active      INTEGER NOT NULL DEFAULT 1
         )
-    """)
+        """
+    )
     # Spalten für Farben ergänzen
     cur.execute("PRAGMA table_info(locations)")
     loc_cols = [row[1] for row in cur.fetchall()]
@@ -90,7 +92,8 @@ def init_db(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE locations ADD COLUMN text_color TEXT")
 
     # Tabelle: Abfahrten
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS departures (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             datetime     TEXT NOT NULL,       -- ISO-String
@@ -100,10 +103,12 @@ def init_db(conn: sqlite3.Connection):
             note         TEXT,
             FOREIGN KEY(location_id) REFERENCES locations(id)
         )
-    """)
+        """
+    )
 
     # Tabelle: feste Touren
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS tours (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             name         TEXT NOT NULL,
@@ -114,7 +119,8 @@ def init_db(conn: sqlite3.Connection):
             active       INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY(location_id) REFERENCES locations(id)
         )
-    """)
+        """
+    )
     # Spalte für Monitore (Screens) ergänzen
     cur.execute("PRAGMA table_info(tours)")
     tour_cols = [row[1] for row in cur.fetchall()]
@@ -122,7 +128,8 @@ def init_db(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE tours ADD COLUMN screen_ids TEXT")
 
     # Tabelle: Screens / Monitore
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS screens (
             id                        INTEGER PRIMARY KEY,
             name                      TEXT NOT NULL,
@@ -131,7 +138,8 @@ def init_db(conn: sqlite3.Connection):
             filter_locations          TEXT,
             refresh_interval_seconds  INTEGER NOT NULL DEFAULT 30
         )
-    """)
+        """
+    )
     # Zusatzspalten für Feiertag/Sonderplan
     cur.execute("PRAGMA table_info(screens)")
     s_cols = [row[1] for row in cur.fetchall()]
@@ -141,13 +149,15 @@ def init_db(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE screens ADD COLUMN special_flag INTEGER NOT NULL DEFAULT 0")
 
     # Tabelle: Laufband/Ticker
-    cur.execute("""
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS ticker (
             id     INTEGER PRIMARY KEY,
             text   TEXT,
             active INTEGER NOT NULL DEFAULT 0
         )
-    """)
+        """
+    )
     cur.execute("SELECT COUNT(*) FROM ticker")
     if cur.fetchone()[0] == 0:
         cur.execute("INSERT INTO ticker (id, text, active) VALUES (1, '', 0)")
@@ -164,11 +174,14 @@ def init_db(conn: sqlite3.Connection):
             (5, "Übersicht Links",  "OVERVIEW", "ALLE",        "", 20, 0, 0),
             (6, "Übersicht Rechts", "OVERVIEW", "ALLE",        "", 20, 0, 0),
         ]
-        cur.executemany("""
+        cur.executemany(
+            """
             INSERT INTO screens
                 (id, name, mode, filter_type, filter_locations, refresh_interval_seconds, holiday_flag, special_flag)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, screens)
+            """,
+            screens,
+        )
 
     conn.commit()
 
@@ -187,7 +200,9 @@ def load_locations(conn):
 
 def load_departures_with_locations(conn):
     """Abfahrten inkl. Einrichtungsnamen/-typ + Farben."""
-    df = read_df(conn, """
+    df = read_df(
+        conn,
+        """
         SELECT d.id,
                d.datetime,
                d.location_id,
@@ -201,7 +216,8 @@ def load_departures_with_locations(conn):
                l.text_color AS location_text_color
         FROM departures d
         JOIN locations l ON d.location_id = l.id
-    """)
+        """,
+    )
     if not df.empty:
         df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     return df
@@ -212,7 +228,9 @@ def load_screens(conn):
 
 
 def load_tours(conn):
-    return read_df(conn, """
+    return read_df(
+        conn,
+        """
         SELECT t.id,
                t.name,
                t.weekday,
@@ -225,7 +243,8 @@ def load_tours(conn):
         FROM tours t
         JOIN locations l ON t.location_id = l.id
         ORDER BY t.id
-    """)
+        """,
+    )
 
 
 def load_ticker(conn):
@@ -271,10 +290,18 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
     now = datetime.now()
 
     if deps.empty:
-        return screen, pd.DataFrame(columns=[
-            "datetime", "location_name", "location_type",
-            "vehicle", "status", "note", "location_color", "location_text_color"
-        ])
+        return screen, pd.DataFrame(
+            columns=[
+                "datetime",
+                "location_name",
+                "location_type",
+                "vehicle",
+                "status",
+                "note",
+                "location_color",
+                "location_text_color",
+            ]
+        )
 
     future = deps[deps["datetime"] >= now].copy()
 
@@ -301,7 +328,7 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None):
     thead_cells = "".join(f"<th>{h}</th>" for h in headers)
     body_rows = ""
 
-    rows = list(rows)  # Iterator in Liste umwandeln
+    rows = list(rows)
 
     for idx, r in enumerate(rows):
         style_parts = []
@@ -330,11 +357,7 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None):
 
 def escape_html(text: str) -> str:
     """Einfache HTML-Escaping-Funktion für den Ticker-Text."""
-    return (
-        text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-    )
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def show_display_mode(screen_id: int):
@@ -480,11 +503,17 @@ def show_display_mode(screen_id: int):
             render_big_table(headers, rows, row_colors=row_colors, text_colors=row_text_colors)
 
         elif screen["mode"] == "DETAIL":
-            # Detail-Ansicht anderer Screens
-            subset = data[[
-                "location_name", "location_type", "vehicle", "status", "note",
-                "location_color", "location_text_color"
-            ]].copy()
+            subset = data[
+                [
+                    "location_name",
+                    "location_type",
+                    "vehicle",
+                    "status",
+                    "note",
+                    "location_color",
+                    "location_text_color",
+                ]
+            ].copy()
             subset["location_color"] = subset["location_color"].fillna("")
             subset["location_text_color"] = subset["location_text_color"].fillna("")
             headers = ["Einrichtung", "Typ", "Fahrzeug", "Status", "Hinweis"]
@@ -517,9 +546,9 @@ def show_display_mode(screen_id: int):
                             tc = row.get("location_text_color") or ""
                             style_str = "margin-bottom:10px;"
                             if bg:
-                                style_str += f"background-color:{bg};padding:0.3em 0.5em;border-radius:0.2em;"
+                                style_str += "background-color:" + bg + ";padding:0.3em 0.5em;border-radius:0.2em;"
                             if tc:
-                                style_str += f"color:{tc};"
+                                style_str += "color:" + tc + ";"
 
                             st.markdown(f"<div style='{style_str}'>{txt}</div>", unsafe_allow_html=True)
 
@@ -587,8 +616,9 @@ def show_admin_locations(conn):
             with col1:
                 name_edit = st.text_input("Name", row["name"])
                 typ_edit = st.selectbox(
-                    "Typ", ["KRANKENHAUS", "ALTENHEIM", "MVZ"],
-                    index=["KRANKENHAUS", "ALTENHEIM", "MVZ"].index(row["type"])
+                    "Typ",
+                    ["KRANKENHAUS", "ALTENHEIM", "MVZ"],
+                    index=["KRANKENHAUS", "ALTENHEIM", "MVZ"].index(row["type"]),
                 )
             with col2:
                 active_edit = st.checkbox("Aktiv", value=bool(row["active"]))
@@ -617,7 +647,6 @@ def show_admin_locations(conn):
                 st.rerun()
 
             if delete_requested:
-                # Prüfen, ob noch Abfahrten oder Touren auf diese Einrichtung zeigen
                 cur = conn.cursor()
                 cur.execute("SELECT COUNT(*) FROM departures WHERE location_id = ?", (int(selected),))
                 dep_count = cur.fetchone()[0]
@@ -658,7 +687,7 @@ def show_admin_departures(conn, can_edit: bool):
                 weekday = st.selectbox("Wochentag", WEEKDAYS_DE)
             with col2:
                 hours = [f"{h:02d}:00" for h in range(24)]
-                hour_label = st.selectbox("Uhrzeit (volle Stunde)", hours, index=8)  # Standard: 08:00
+                hour_label = st.selectbox("Uhrzeit (volle Stunde)", hours, index=8)
                 hour_int = int(hour_label.split(":")[0])
             with col3:
                 loc_id = st.selectbox(
@@ -701,9 +730,7 @@ def show_admin_departures(conn, can_edit: bool):
 
             with col1:
                 dt_str = row["datetime"].strftime("%Y-%m-%d %H:%M") if pd.notnull(row["datetime"]) else "-"
-                st.markdown(
-                    f"**{dt_str} – {row['location_name']} ({row['location_type']})**"
-                )
+                st.markdown(f"**{dt_str} – {row['location_name']} ({row['location_type']})**")
                 info = []
                 if row.get("vehicle"):
                     info.append(f"Fahrzeug: {row['vehicle']}")
@@ -741,6 +768,7 @@ def show_admin_tours(conn, can_edit: bool):
     screens = load_screens(conn)
     screen_map = {int(r["id"]): r["name"] for _, r in screens.iterrows()} if not screens.empty else {}
 
+    # Übersicht aller Touren
     tours = load_tours(conn)
 
     st.write("Bestehende Touren:")
@@ -817,13 +845,13 @@ def show_admin_tours(conn, can_edit: bool):
                 INSERT INTO tours (name, weekday, hour, location_id, note, active, screen_ids)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (tour_name.strip(), weekday, hour_int, int(loc_id), note_new.strip(),
-                 1 if active_new else 0, screen_ids_str_new),
+                (tour_name.strip(), weekday, hour_int, int(loc_id), note_new.strip(), 1 if active_new else 0, screen_ids_str_new),
             )
             conn.commit()
             st.success("Tour gespeichert.")
             st.rerun()
 
+    # Bestehende Tour bearbeiten / Abfahrt erzeugen / löschen
     tours = load_tours(conn)
     if tours.empty:
         return
@@ -840,8 +868,7 @@ def show_admin_tours(conn, can_edit: bool):
         weekday_edit = st.selectbox(
             "Wochentag",
             WEEKDAYS_DE,
-            index=WEEKDAYS_DE.index(row["weekday"]) if row["weekday"] in WEEKD
-EYS_DE else 0,
+            index=WEEKDAYS_DE.index(row["weekday"]) if row["weekday"] in WEEKDAYS_DE else 0,
             key=f"edit_tour_weekday_{selected}",
         )
     with col2:
@@ -915,8 +942,7 @@ EYS_DE else 0,
                 SET name = ?, weekday = ?, hour = ?, location_id = ?, note = ?, active = ?, screen_ids = ?
                 WHERE id = ?
                 """,
-                (name_edit.strip(), weekday_edit, hour_edit, int(loc_id_edit),
-                 note_edit.strip(), 1 if active_edit else 0, screen_ids_str_edit, int(selected)),
+                (name_edit.strip(), weekday_edit, hour_edit, int(loc_id_edit), note_edit.strip(), 1 if active_edit else 0, screen_ids_str_edit, int(selected)),
             )
             conn.commit()
             st.success("Tour aktualisiert.")
@@ -988,11 +1014,11 @@ def show_admin_screens(conn):
 
     with st.form("edit_screen"):
         name = st.text_input("Name", row["name"])
-        mode = st.selectbox("Modus", ["DETAIL", "OVERVIEW"],
-                            index=["DETAIL", "OVERVIEW"].index(row["mode"]))
+        mode = st.selectbox("Modus", ["DETAIL", "OVERVIEW"], index=["DETAIL", "OVERVIEW"].index(row["mode"]))
         filter_type = st.selectbox(
-            "Filter Typ", ["ALLE", "KRANKENHAUS", "ALTENHEIM", "MVZ"],
-            index=["ALLE", "KRANKENHAUS", "ALTENHEIM", "MVZ"].index(row["filter_type"])
+            "Filter Typ",
+            ["ALLE", "KRANKENHAUS", "ALTENHEIM", "MVZ"],
+            index=["ALLE", "KRANKENHAUS", "ALTENHEIM", "MVZ"].index(row["filter_type"]),
         )
         filter_locations = st.text_input(
             "Filter Locations (IDs, Komma-getrennt)",
@@ -1001,28 +1027,25 @@ def show_admin_screens(conn):
         )
         refresh = st.number_input(
             "Refresh-Intervall (Sekunden)",
-            min_value=5, max_value=300,
+            min_value=5,
+            max_value=300,
             value=int(row["refresh_interval_seconds"]),
         )
-        holiday_flag = st.checkbox(
-            "Feiertagsbelieferung aktiv",
-            value=bool(row.get("holiday_flag", 0))
-        )
-        special_flag = st.checkbox(
-            "Sonderplan aktiv",
-            value=bool(row.get("special_flag", 0))
-        )
+        holiday_flag = st.checkbox("Feiertagsbelieferung aktiv", value=bool(row.get("holiday_flag", 0)))
+        special_flag = st.checkbox("Sonderplan aktiv", value=bool(row.get("special_flag", 0)))
 
         submitted = st.form_submit_button("Speichern")
         if submitted:
             cur = conn.cursor()
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE screens
                 SET name = ?, mode = ?, filter_type = ?, filter_locations = ?,
                     refresh_interval_seconds = ?, holiday_flag = ?, special_flag = ?
                 WHERE id = ?
-            """, (name, mode, filter_type, filter_locations,
-                  int(refresh), 1 if holiday_flag else 0, 1 if special_flag else 0, int(selected)))
+                """,
+                (name, mode, filter_type, filter_locations, int(refresh), 1 if holiday_flag else 0, 1 if special_flag else 0, int(selected)),
+            )
             conn.commit()
             st.success("Screen aktualisiert.")
             st.rerun()
@@ -1041,8 +1064,7 @@ def show_admin_screens(conn):
         submitted_ticker = st.form_submit_button("Laufband speichern")
         if submitted_ticker:
             cur = conn.cursor()
-            cur.execute("UPDATE ticker SET text = ?, active = ? WHERE id = 1",
-                        (text.strip(), 1 if active else 0))
+            cur.execute("UPDATE ticker SET text = ?, active = ? WHERE id = 1", (text.strip(), 1 if active else 0))
             conn.commit()
             st.success("Laufband aktualisiert.")
             st.rerun()
@@ -1053,7 +1075,7 @@ def show_admin_screens(conn):
 # --------------------------------------------------
 
 def show_admin_mode():
-    require_login()  # Login erzwingen
+    require_login()
 
     role = st.session_state.get("role", "viewer")
     username = st.session_state.get("username", "")
@@ -1068,7 +1090,7 @@ def show_admin_mode():
         st.rerun()
 
     conn = get_connection()
-    can_edit = (role == "admin")
+    can_edit = role == "admin"
 
     if role == "admin":
         tabs = st.tabs(["Abfahrten", "Einrichtungen", "Screens", "Touren"])
