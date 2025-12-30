@@ -1,15 +1,13 @@
-from flask import Flask, request, render_template, redirect, url_for
+import streamlit as st
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
-app = Flask(__name__)
-
 EXCEL_PATH = Path("daten.xlsx")
 
 
+@st.cache_data
 def load_excel():
-    """Excel-Datei komplett einlesen."""
     xl = pd.ExcelFile(EXCEL_PATH)
     locations = pd.read_excel(xl, "locations")
     departures = pd.read_excel(xl, "departures")
@@ -18,39 +16,43 @@ def load_excel():
 
 
 def save_excel(locations, departures, screens):
-    """Excel-Datei komplett neu schreiben."""
+    # Achtung: cache invalidieren, wenn du schreibst
     with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl", mode="w") as writer:
         locations.to_excel(writer, sheet_name="locations", index=False)
         departures.to_excel(writer, sheet_name="departures", index=False)
         screens.to_excel(writer, sheet_name="screens", index=False)
-@app.route("/display")
-def display():
-    screen_id = request.args.get("screenId", type=int)
-    if not screen_id:
-        return "screenId fehlt", 400
+    load_excel.clear()  # cache leeren
 
+
+def show_display_mode(screen_id: int):
     locations, departures, screens = load_excel()
 
-    # Screen-Konfiguration holen
-    screen = screens.loc[screens["id"] == screen_id]
-    if screen.empty:
-        return f"Screen {screen_id} nicht konfiguriert", 404
+    if screen_id not in screens["id"].values:
+        st.error(f"Screen {screen_id} ist in 'screens'-Tabelle nicht konfiguriert.")
+        return
 
-    screen = screen.iloc[0]
+    screen = screens.loc[screens["id"] == screen_id].iloc[0]
     mode = screen["mode"]  # DETAIL oder OVERVIEW
-    filter_type = screen.get("filter_type", "ALLE")
+    filter_type = str(screen.get("filter_type", "ALLE"))
     filter_locations = str(screen.get("filter_locations") or "").strip()
     refresh_interval = int(screen.get("refresh_interval_seconds") or 30)
 
-    # Nur zukünftige/aktuelle Abfahrten (z. B. ab jetzt - 10 min)
+    # Auto-Refresh (in Sekunden)
+    st_autorefresh = st.experimental_rerun  # Dummy, für Info
+    st.write(f"Aktualisierung alle {refresh_interval} Sekunden (bitte später mit st_autorefresh umsetzen).")
+
     now = datetime.now()
     departures["datetime"] = pd.to_datetime(departures["datetime"])
-    future_dep = departures[departures["datetime"] >= (now)]
+    future_dep = departures[departures["datetime"] >= now]
 
-    # Join mit locations
-    merged = future_dep.merge(locations, left_on="location_id", right_on="id", suffixes=("_dep", "_loc"))
+    merged = future_dep.merge(
+        locations,
+        left_on="location_id",
+        right_on="id",
+        suffixes=("_dep", "_loc"),
+    )
 
-    # Filter nach type (KRANKENHAUS/ALTENHEIM/MVZ)
+    # Filter nach type
     if filter_type and filter_type != "ALLE":
         merged = merged[merged["type"] == filter_type]
 
@@ -60,51 +62,93 @@ def display():
         if ids:
             merged = merged[merged["location_id"].isin(ids)]
 
-    # Sortieren nach Zeit
     merged = merged.sort_values("datetime")
 
+    st.markdown(f"### Anzeige für Screen {screen_id}: {screen['name']}")
     if mode == "DETAIL":
-        # einfache Liste
-        data = merged.to_dict(orient="records")
-        return render_template("display_detail.html",
-                               screen=screen,
-                               departures=data,
-                               refresh_interval=refresh_interval)
+        st.markdown("**Modus: DETAIL**")
+        st.dataframe(
+            merged[["datetime", "name", "type", "vehicle", "status", "note"]],
+            use_container_width=True,
+        )
     else:
-        # "OVERVIEW" – du kannst hier gruppieren, z. B. nach type
-        data = merged.to_dict(orient="records")
-        return render_template("display_overview.html",
-                               screen=screen,
-                               departures=data,
-                               refresh_interval=refresh_interval)
-@app.route("/admin", methods=["GET", "POST"])
-def admin():
+        st.markdown("**Modus: OVERVIEW**")
+        # Einfache Übersicht – z. B. gruppiert nach type
+        for t, group in merged.groupby("type"):
+            st.markdown(f"#### {t}")
+            st.table(group[["datetime", "name", "vehicle", "status", "note"]])
+
+
+def show_admin_mode():
+    st.title("Admin / Disposition")
+
     locations, departures, screens = load_excel()
 
-    if request.method == "POST":
-        # neue Abfahrt anlegen
-        # (hier sehr einfach, ohne Validierung)
-        new_id = (departures["id"].max() or 0) + 1
-        dt_str = request.form["datetime"]  # "2025-01-10 13:45"
-        loc_id = int(request.form["location_id"])
-        vehicle = request.form.get("vehicle", "")
-        note = request.form.get("note", "")
+    st.subheader("Neue Abfahrt anlegen")
+    with st.form("new_departure"):
+        col1, col2 = st.columns(2)
+        with col1:
+            dt = st.text_input("Datum & Uhrzeit (YYYY-MM-DD HH:MM)", "")
+            loc = st.selectbox(
+                "Einrichtung",
+                options=locations["id"],
+                format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
+            )
+        with col2:
+            vehicle = st.text_input("Fahrzeug", "")
+            note = st.text_input("Hinweis", "")
 
-        new_row = {
-            "id": new_id,
-            "datetime": dt_str,
-            "location_id": loc_id,
-            "vehicle": vehicle,
-            "status": "GEPLANT",
-            "note": note,
-        }
+        submitted = st.form_submit_button("Speichern")
+        if submitted:
+            try:
+                pd.to_datetime(dt)  # Einfache Validierung
+            except ValueError:
+                st.error("Ungültiges Datum/Uhrzeit-Format.")
+            else:
+                new_id = (departures["id"].max() or 0) + 1
+                new_row = {
+                    "id": new_id,
+                    "datetime": dt,
+                    "location_id": loc,
+                    "vehicle": vehicle,
+                    "status": "GEPLANT",
+                    "note": note,
+                }
+                departures = pd.concat([departures, pd.DataFrame([new_row])], ignore_index=True)
+                save_excel(locations, departures, screens)
+                st.success("Abfahrt gespeichert.")
 
-        departures = pd.concat([departures, pd.DataFrame([new_row])], ignore_index=True)
-        save_excel(locations, departures, screens)
-        return redirect(url_for("admin"))
+    st.subheader("Alle Abfahrten")
+    st.dataframe(
+        departures.sort_values("datetime"),
+        use_container_width=True,
+    )
 
-    # GET: Admin-Oberfläche rendern
-    departures_sorted = departures.sort_values("datetime")
-    loc_list = locations.to_dict(orient="records")
-    dep_list = departures_sorted.to_dict(orient="records")
-    return render_template("admin.html", locations=loc_list, departures=dep_list)
+    st.subheader("Screens-Konfiguration (nur Ansicht)")
+    st.dataframe(screens, use_container_width=True)
+
+
+def main():
+    # Query-Parameter auslesen: ?screenId=1&mode=display
+    params = st.experimental_get_query_params()
+    mode = params.get("mode", ["admin"])[0]  # default: admin
+    screen_id_param = params.get("screenId", [None])[0]
+
+    # Für echte Monitore: mode=display&screenId=X in der URL verwenden
+    if mode == "display" and screen_id_param is not None:
+        try:
+            screen_id = int(screen_id_param)
+        except ValueError:
+            st.error("screenId muss eine Zahl sein.")
+        else:
+            # Display-Ansicht möglichst „clean“ machen
+            st.set_page_config(layout="wide")
+            show_display_mode(screen_id)
+    else:
+        # Admin-Modus
+        st.set_page_config(layout="wide")
+        show_admin_mode()
+
+
+if __name__ == "__main__":
+    main()
