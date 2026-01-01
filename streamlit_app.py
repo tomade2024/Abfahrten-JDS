@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import json
+import io
+import time
 from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -104,14 +106,126 @@ def require_login():
 
 
 # --------------------------------------------------
+# DB Robustness Helpers
+# --------------------------------------------------
+
+def integrity_ok(conn: sqlite3.Connection) -> bool:
+    try:
+        r = conn.execute("PRAGMA integrity_check;").fetchone()
+        if not r:
+            return True
+        return str(r[0]).lower() == "ok"
+    except Exception:
+        return False
+
+def execute_with_retry(cur: sqlite3.Cursor, sql: str, params: tuple, retries: int = 6):
+    for i in range(retries):
+        try:
+            cur.execute(sql, params)
+            return
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "locked" in msg or "busy" in msg:
+                time.sleep(0.25 * (i + 1))
+                continue
+            raise
+
+def migrate_db(conn: sqlite3.Connection):
+    """
+    Migrationen für alte DB-Versionen (fehlende Spalten/Indizes).
+    """
+    cur = conn.cursor()
+
+    def table_cols(table: str) -> set[str]:
+        try:
+            rows = cur.execute(f"PRAGMA table_info({table});").fetchall()
+            return {str(r[1]) for r in rows}
+        except Exception:
+            return set()
+
+    deps = table_cols("departures")
+    if deps:
+        if "screen_id" not in deps:
+            cur.execute("ALTER TABLE departures ADD COLUMN screen_id INTEGER;")
+        if "source_key" not in deps:
+            cur.execute("ALTER TABLE departures ADD COLUMN source_key TEXT;")
+        if "created_by" not in deps:
+            cur.execute("ALTER TABLE departures ADD COLUMN created_by TEXT;")
+        if "ready_at" not in deps:
+            cur.execute("ALTER TABLE departures ADD COLUMN ready_at TEXT;")
+        if "completed_at" not in deps:
+            cur.execute("ALTER TABLE departures ADD COLUMN completed_at TEXT;")
+
+    locs = table_cols("locations")
+    if locs:
+        if "color" not in locs:
+            cur.execute("ALTER TABLE locations ADD COLUMN color TEXT;")
+        if "text_color" not in locs:
+            cur.execute("ALTER TABLE locations ADD COLUMN text_color TEXT;")
+
+    tours = table_cols("tours")
+    if tours and "screen_ids" not in tours:
+        cur.execute("ALTER TABLE tours ADD COLUMN screen_ids TEXT;")
+
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_departures_source_key ON departures(source_key);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_departures_screen_id ON departures(screen_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_departures_datetime ON departures(datetime);")
+    except Exception:
+        pass
+
+    conn.commit()
+
+
+# --------------------------------------------------
 # DB / Init
 # --------------------------------------------------
 
 @st.cache_resource
 def get_connection():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+    except Exception:
+        pass
+
+    # DB-Integrity Check: wenn kaputt -> umbenennen & neu erstellen
+    if not integrity_ok(conn):
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+        bad_name = DB_PATH.with_suffix(f".corrupt_{int(now_berlin().timestamp())}.db")
+        try:
+            if DB_PATH.exists():
+                DB_PATH.rename(bad_name)
+        except Exception:
+            try:
+                DB_PATH.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA busy_timeout=30000;")
+        except Exception:
+            pass
+
     init_db(conn)
+    migrate_db(conn)
+
     return conn
 
 
@@ -217,13 +331,13 @@ def init_db(conn: sqlite3.Connection):
     cur.execute("SELECT COUNT(*) AS cnt FROM screens")
     if cur.fetchone()[0] == 0:
         defaults = [
-            (1, "Zone A",              "DETAIL",   "ALLE", "", 15, 0, 0),
-            (2, "Zone B",              "DETAIL",   "ALLE", "", 15, 0, 0),
-            (3, "Zone C",              "DETAIL",   "ALLE", "", 15, 0, 0),
-            (4, "Zone D",              "DETAIL",   "ALLE", "", 15, 0, 0),
-            (5, "Übersicht Links",     "OVERVIEW", "ALLE", "", 20, 0, 0),
-            (6, "Übersicht Rechts",    "OVERVIEW", "ALLE", "", 20, 0, 0),
-            (7, "Lagerstand Übersicht","WAREHOUSE","ALLE", "", 20, 0, 0),
+            (1, "Zone A",               "DETAIL",   "ALLE", "", 15, 0, 0),
+            (2, "Zone B",               "DETAIL",   "ALLE", "", 15, 0, 0),
+            (3, "Zone C",               "DETAIL",   "ALLE", "", 15, 0, 0),
+            (4, "Zone D",               "DETAIL",   "ALLE", "", 15, 0, 0),
+            (5, "Übersicht Links",      "OVERVIEW", "ALLE", "", 20, 0, 0),
+            (6, "Übersicht Rechts",     "OVERVIEW", "ALLE", "", 20, 0, 0),
+            (7, "Lagerstand Übersicht", "WAREHOUSE","ALLE", "", 20, 0, 0),
         ]
         cur.executemany(
             """
@@ -463,7 +577,8 @@ def materialize_tours_to_departures(conn: sqlite3.Connection, create_window_hour
         for sid in screen_ids:
             source_key = f"TOUR:{tour_id}:{pos}:{sid}:{dep_dt.isoformat()}"
             try:
-                cur.execute(
+                execute_with_retry(
+                    cur,
                     """
                     INSERT INTO departures (datetime, location_id, vehicle, status, note, source_key, created_by, screen_id)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -629,7 +744,7 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None):
 
 
 # --------------------------------------------------
-# Import/Export JSON
+# Import/Export JSON + Backup + CSV
 # --------------------------------------------------
 
 def export_locations_json(conn) -> bytes:
@@ -825,6 +940,57 @@ def import_tours_json(conn, data: dict) -> tuple[int, int]:
     conn.commit()
     return inserted, updated
 
+def export_backup_json(conn) -> bytes:
+    payload = {
+        "version": 1,
+        "exported_at": now_berlin().isoformat(),
+        "locations": load_locations(conn).to_dict(orient="records"),
+        "tours": json.loads(export_tours_json(conn).decode("utf-8")).get("tours", []),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+def import_backup_json(conn, data: dict) -> tuple[tuple[int, int], tuple[int, int]]:
+    loc_ins, loc_upd = import_locations_json(conn, {"locations": data.get("locations", [])})
+    tour_ins, tour_upd = import_tours_json(conn, {"tours": data.get("tours", [])})
+    return (loc_ins, loc_upd), (tour_ins, tour_upd)
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    out = io.StringIO()
+    df.to_csv(out, index=False, sep=";", encoding="utf-8")
+    return ("\ufeff" + out.getvalue()).encode("utf-8")
+
+def export_locations_csv(conn) -> bytes:
+    df = load_locations(conn)
+    return df_to_csv_bytes(df)
+
+def export_tours_csv(conn) -> tuple[bytes, bytes]:
+    tours = load_tours(conn)
+    if tours.empty:
+        touren_df = pd.DataFrame(columns=["id", "name", "weekday", "hour", "note", "active", "screen_ids", "location_id", "primary_location_name"])
+        stops_df = pd.DataFrame(columns=["tour_id", "position", "location_id", "location_name"])
+        return df_to_csv_bytes(touren_df), df_to_csv_bytes(stops_df)
+
+    touren_out = tours.rename(columns={"location_name": "primary_location_name"})[
+        ["id", "name", "weekday", "hour", "note", "active", "screen_ids", "location_id", "primary_location_name"]
+    ].copy()
+
+    stops_rows = []
+    for _, t in tours.iterrows():
+        tid = int(t["id"])
+        s = load_tour_stops(conn, tid)
+        if s.empty:
+            continue
+        for _, r in s.iterrows():
+            stops_rows.append({
+                "tour_id": tid,
+                "position": int(r["position"]),
+                "location_id": int(r["location_id"]),
+                "location_name": str(r["location_name"]),
+            })
+    stops_df = pd.DataFrame(stops_rows, columns=["tour_id", "position", "location_id", "location_name"])
+
+    return df_to_csv_bytes(touren_out), df_to_csv_bytes(stops_df)
+
 
 # --------------------------------------------------
 # Display Mode
@@ -986,7 +1152,7 @@ def show_display_mode(screen_id: int):
 
 
 # --------------------------------------------------
-# Admin: Einrichtungen + Import/Export
+# Admin: Einrichtungen + Import/Export (JSON+CSV)
 # --------------------------------------------------
 
 def show_admin_locations(conn, can_edit: bool):
@@ -998,18 +1164,41 @@ def show_admin_locations(conn, can_edit: bool):
     else:
         st.dataframe(locations, use_container_width=True)
 
-    if not can_edit:
-        st.info("Nur Admin kann Einrichtungen anlegen/bearbeiten/löschen.")
-        st.markdown("---")
-        st.markdown("### Export (Einrichtungen)")
+    st.markdown("---")
+    st.markdown("### Export (Einrichtungen)")
+    col_e1, col_e2 = st.columns(2)
+    with col_e1:
         st.download_button(
             "Download einrichtungen.json",
             data=export_locations_json(conn),
             file_name="einrichtungen.json",
             mime="application/json",
         )
+    with col_e2:
+        st.download_button(
+            "Download einrichtungen.csv",
+            data=export_locations_csv(conn),
+            file_name="einrichtungen.csv",
+            mime="text/csv",
+        )
+
+    if not can_edit:
+        st.info("Nur Admin kann Einrichtungen anlegen/bearbeiten/löschen/importieren.")
         return
 
+    st.markdown("---")
+    st.markdown("### Import (Einrichtungen)")
+    up = st.file_uploader("einrichtungen.json importieren", type=["json"], key="upl_locations")
+    if up is not None:
+        try:
+            data = json.loads(up.getvalue().decode("utf-8"))
+            ins, upd = import_locations_json(conn, data)
+            st.success(f"Import erfolgreich. Neu: {ins}, Aktualisiert: {upd}")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Import fehlgeschlagen: {e}")
+
+    st.markdown("---")
     st.markdown("### Neue Einrichtung anlegen")
     with st.form("new_location"):
         col1, col2, col3 = st.columns(3)
@@ -1085,29 +1274,6 @@ def show_admin_locations(conn, can_edit: bool):
                 conn.commit()
                 st.success("Einrichtung gelöscht.")
                 st.rerun()
-
-    st.markdown("---")
-    st.markdown("### Import / Export (Einrichtungen)")
-    colx, coly = st.columns(2)
-
-    with colx:
-        st.download_button(
-            "Download einrichtungen.json",
-            data=export_locations_json(conn),
-            file_name="einrichtungen.json",
-            mime="application/json",
-        )
-
-    with coly:
-        up = st.file_uploader("Einrichtungen importieren (einrichtungen.json)", type=["json"], key="upl_locations")
-        if up is not None:
-            try:
-                data = json.loads(up.getvalue().decode("utf-8"))
-                ins, upd = import_locations_json(conn, data)
-                st.success(f"Import erfolgreich. Neu: {ins}, Aktualisiert: {upd}")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Import fehlgeschlagen: {e}")
 
 
 # --------------------------------------------------
@@ -1210,7 +1376,7 @@ def show_admin_departures(conn, can_edit: bool):
 
 
 # --------------------------------------------------
-# Admin: Touren + Import/Export
+# Admin: Touren + Import/Export (JSON+CSV)
 # --------------------------------------------------
 
 def show_admin_tours(conn, can_edit: bool):
@@ -1238,17 +1404,49 @@ def show_admin_tours(conn, can_edit: bool):
         st.dataframe(view[["id", "name", "weekday", "Zeit", "location_name", "note", "active", "Monitore"]],
                      use_container_width=True)
 
-    if not can_edit:
-        st.markdown("---")
-        st.markdown("### Export (Touren)")
+    st.markdown("---")
+    st.markdown("### Export (Touren)")
+    col_t1, col_t2, col_t3 = st.columns(3)
+    with col_t1:
         st.download_button(
             "Download touren.json",
             data=export_tours_json(conn),
             file_name="touren.json",
             mime="application/json",
         )
+    touren_csv, stops_csv = export_tours_csv(conn)
+    with col_t2:
+        st.download_button(
+            "Download touren.csv",
+            data=touren_csv,
+            file_name="touren.csv",
+            mime="text/csv",
+        )
+    with col_t3:
+        st.download_button(
+            "Download tour_stops.csv",
+            data=stops_csv,
+            file_name="tour_stops.csv",
+            mime="text/csv",
+        )
+
+    if not can_edit:
+        st.info("Nur Admin kann Touren anlegen/bearbeiten/löschen/importieren.")
         return
 
+    st.markdown("---")
+    st.markdown("### Import (Touren)")
+    up = st.file_uploader("touren.json importieren", type=["json"], key="upl_tours")
+    if up is not None:
+        try:
+            data = json.loads(up.getvalue().decode("utf-8"))
+            ins, upd = import_tours_json(conn, data)
+            st.success(f"Import erfolgreich. Neu: {ins}, Aktualisiert: {upd}")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Import fehlgeschlagen: {e}")
+
+    st.markdown("---")
     st.markdown("### Neue Tour anlegen")
     with st.form("new_tour_form"):
         col1, col2, col3 = st.columns(3)
@@ -1307,113 +1505,92 @@ def show_admin_tours(conn, can_edit: bool):
                 st.rerun()
 
     tours = load_tours(conn)
-    if not tours.empty:
-        st.markdown("### Tour bearbeiten / löschen")
-        tour_ids = tours["id"].tolist()
-        selected = st.selectbox("Tour auswählen", tour_ids, key="edit_tour_select")
-        row = tours.loc[tours["id"] == selected].iloc[0]
+    if tours.empty:
+        return
 
-        stops_df = read_df(conn, "SELECT location_id FROM tour_stops WHERE tour_id=? ORDER BY position", (int(selected),))
-        existing_stop_ids = stops_df["location_id"].tolist() if not stops_df.empty else [int(row["location_id"])]
+    st.markdown("### Tour bearbeiten / löschen")
+    tour_ids = tours["id"].tolist()
+    selected = st.selectbox("Tour auswählen", tour_ids, key="edit_tour_select")
+    row = tours.loc[tours["id"] == selected].iloc[0]
 
-        existing_screen_ids = parse_screen_ids(row["screen_ids"])
+    stops_df = read_df(conn, "SELECT location_id FROM tour_stops WHERE tour_id=? ORDER BY position", (int(selected),))
+    existing_stop_ids = stops_df["location_id"].tolist() if not stops_df.empty else [int(row["location_id"])]
 
-        with st.form("edit_tour_form"):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                name_edit = st.text_input("Tour-Name", row["name"])
-                weekday_edit = st.selectbox(
-                    "Wochentag",
-                    WEEKDAYS_DE,
-                    index=WEEKDAYS_DE.index(row["weekday"]) if row["weekday"] in WEEKDAYS_DE else 0,
-                )
-            with col2:
-                hours = [f"{h:02d}:00" for h in range(24)]
-                default_hour = int(row["hour"]) if str(row["hour"]).isdigit() and 0 <= int(row["hour"]) < 24 else 8
-                hour_edit_label = st.selectbox("Uhrzeit (volle Stunde)", hours, index=default_hour)
-                hour_edit = int(hour_edit_label.split(":")[0])
-            with col3:
-                screens_edit = st.multiselect(
-                    "Monitore (Screens) für diese Tour",
-                    options=screen_options,
-                    format_func=lambda sid: f"{sid}: {screen_map.get(sid)}",
-                    default=existing_screen_ids,
-                )
+    existing_screen_ids = parse_screen_ids(row["screen_ids"])
 
-            stops_edit = st.multiselect(
-                "Einrichtungen (Stops) in Reihenfolge",
-                options=loc_options,
-                format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
-                default=existing_stop_ids,
+    with st.form("edit_tour_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            name_edit = st.text_input("Tour-Name", row["name"])
+            weekday_edit = st.selectbox(
+                "Wochentag",
+                WEEKDAYS_DE,
+                index=WEEKDAYS_DE.index(row["weekday"]) if row["weekday"] in WEEKDAYS_DE else 0,
             )
-            note_edit = st.text_input("Hinweis (optional)", row["note"] or "")
-            active_edit = st.checkbox("Aktiv", bool(row["active"]))
+        with col2:
+            hours = [f"{h:02d}:00" for h in range(24)]
+            default_hour = int(row["hour"]) if str(row["hour"]).isdigit() and 0 <= int(row["hour"]) < 24 else 8
+            hour_edit_label = st.selectbox("Uhrzeit (volle Stunde)", hours, index=default_hour)
+            hour_edit = int(hour_edit_label.split(":")[0])
+        with col3:
+            screens_edit = st.multiselect(
+                "Monitore (Screens) für diese Tour",
+                options=screen_options,
+                format_func=lambda sid: f"{sid}: {screen_map.get(sid)}",
+                default=existing_screen_ids,
+            )
 
-            c1, c2 = st.columns(2)
-            save = c1.form_submit_button("Änderungen speichern")
-            delete = c2.form_submit_button("Tour löschen")
-
-            if save:
-                if not name_edit.strip():
-                    st.error("Tour-Name darf nicht leer sein.")
-                elif not screens_edit:
-                    st.error("Bitte mindestens einen Screen auswählen.")
-                elif not stops_edit:
-                    st.error("Bitte mindestens einen Stop auswählen.")
-                else:
-                    primary_loc = int(stops_edit[0])
-                    screen_ids_str = ",".join(str(s) for s in screens_edit)
-
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        UPDATE tours
-                        SET name=?, weekday=?, hour=?, location_id=?, note=?, active=?, screen_ids=?
-                        WHERE id=?
-                        """,
-                        (name_edit.strip(), weekday_edit, hour_edit, primary_loc, note_edit.strip(),
-                         1 if active_edit else 0, screen_ids_str, int(selected)),
-                    )
-                    cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(selected),))
-                    for pos, loc_id in enumerate(stops_edit):
-                        cur.execute(
-                            "INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)",
-                            (int(selected), int(loc_id), int(pos)),
-                        )
-                    conn.commit()
-                    st.success("Tour aktualisiert.")
-                    st.rerun()
-
-            if delete:
-                cur = conn.cursor()
-                cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(selected),))
-                cur.execute("DELETE FROM tours WHERE id=?", (int(selected),))
-                conn.commit()
-                st.success("Tour gelöscht.")
-                st.rerun()
-
-    st.markdown("---")
-    st.markdown("### Import / Export (Touren)")
-    colx, coly = st.columns(2)
-
-    with colx:
-        st.download_button(
-            "Download touren.json",
-            data=export_tours_json(conn),
-            file_name="touren.json",
-            mime="application/json",
+        stops_edit = st.multiselect(
+            "Einrichtungen (Stops) in Reihenfolge",
+            options=loc_options,
+            format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
+            default=existing_stop_ids,
         )
+        note_edit = st.text_input("Hinweis (optional)", row["note"] or "")
+        active_edit = st.checkbox("Aktiv", bool(row["active"]))
 
-    with coly:
-        up = st.file_uploader("Touren importieren (touren.json)", type=["json"], key="upl_tours")
-        if up is not None:
-            try:
-                data = json.loads(up.getvalue().decode("utf-8"))
-                ins, upd = import_tours_json(conn, data)
-                st.success(f"Import erfolgreich. Neu: {ins}, Aktualisiert: {upd}")
+        c1, c2 = st.columns(2)
+        save = c1.form_submit_button("Änderungen speichern")
+        delete = c2.form_submit_button("Tour löschen")
+
+        if save:
+            if not name_edit.strip():
+                st.error("Tour-Name darf nicht leer sein.")
+            elif not screens_edit:
+                st.error("Bitte mindestens einen Screen auswählen.")
+            elif not stops_edit:
+                st.error("Bitte mindestens einen Stop auswählen.")
+            else:
+                primary_loc = int(stops_edit[0])
+                screen_ids_str = ",".join(str(s) for s in screens_edit)
+
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE tours
+                    SET name=?, weekday=?, hour=?, location_id=?, note=?, active=?, screen_ids=?
+                    WHERE id=?
+                    """,
+                    (name_edit.strip(), weekday_edit, hour_edit, primary_loc, note_edit.strip(),
+                     1 if active_edit else 0, screen_ids_str, int(selected)),
+                )
+                cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(selected),))
+                for pos, loc_id in enumerate(stops_edit):
+                    cur.execute(
+                        "INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)",
+                        (int(selected), int(loc_id), int(pos)),
+                    )
+                conn.commit()
+                st.success("Tour aktualisiert.")
                 st.rerun()
-            except Exception as e:
-                st.error(f"Import fehlgeschlagen: {e}")
+
+        if delete:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(selected),))
+            cur.execute("DELETE FROM tours WHERE id=?", (int(selected),))
+            conn.commit()
+            st.success("Tour gelöscht.")
+            st.rerun()
 
 
 # --------------------------------------------------
@@ -1496,7 +1673,7 @@ def show_admin_screens(conn, can_edit: bool):
 
 
 # --------------------------------------------------
-# Admin Mode
+# Admin Mode (inkl. Backup)
 # --------------------------------------------------
 
 def show_admin_mode():
@@ -1516,13 +1693,36 @@ def show_admin_mode():
 
     conn = get_connection()
 
-    # konsistent halten
     materialize_tours_to_departures(conn, create_window_hours=MATERIALIZE_TOURS_HOURS_BEFORE)
     update_departure_statuses(conn)
 
     can_edit = role == "admin"
 
     if can_edit:
+        st.markdown("### Backup (Einrichtungen + Touren)")
+        colb1, colb2 = st.columns(2)
+
+        with colb1:
+            st.download_button(
+                "Backup herunterladen (backup_abfahrten.json)",
+                data=export_backup_json(conn),
+                file_name="backup_abfahrten.json",
+                mime="application/json",
+            )
+
+        with colb2:
+            up = st.file_uploader("Backup importieren (backup_abfahrten.json)", type=["json"], key="upl_backup")
+            if up is not None:
+                try:
+                    data = json.loads(up.getvalue().decode("utf-8"))
+                    (li, lu), (ti, tu) = import_backup_json(conn, data)
+                    st.success(f"Backup importiert. Einrichtungen: Neu {li}, Update {lu} • Touren: Neu {ti}, Update {tu}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Backup-Import fehlgeschlagen: {e}")
+
+        st.markdown("---")
+
         tabs = st.tabs(["Abfahrten", "Einrichtungen", "Touren", "Screens/Ticker"])
         with tabs[0]:
             show_admin_departures(conn, can_edit=True)
