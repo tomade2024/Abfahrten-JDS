@@ -1,3 +1,4 @@
+# streamlit_app.py
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -32,7 +33,18 @@ COUNTDOWN_START_HOURS = 3
 AUTO_COMPLETE_AFTER_MIN = 20
 KEEP_COMPLETED_MINUTES = 10
 
+# Touren werden automatisch zu echten Abfahrten materialisiert (damit Statusautomatik greift)
 MATERIALIZE_TOURS_HOURS_BEFORE = 3
+
+ZONE_SCREEN_IDS = [1, 2, 3, 4, 8, 9]  # Zone A-D + Wareneingang 1/2
+ZONE_NAME_MAP = {
+    1: "Zone A",
+    2: "Zone B",
+    3: "Zone C",
+    4: "Zone D",
+    8: "Wareneingang 1",
+    9: "Wareneingang 2",
+}
 
 
 # ==================================================
@@ -155,41 +167,43 @@ def init_db(conn: sqlite3.Connection):
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS departures (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            datetime     TEXT NOT NULL,
-            location_id  INTEGER NOT NULL,
-            vehicle      TEXT,
-            status       TEXT NOT NULL DEFAULT 'GEPLANT',
-            note         TEXT,
-            ready_at     TEXT,
-            completed_at TEXT,
-            source_key   TEXT,
-            created_by   TEXT,
-            screen_id    INTEGER,
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            datetime           TEXT NOT NULL,
+            location_id        INTEGER NOT NULL,
+            vehicle            TEXT,
+            status             TEXT NOT NULL DEFAULT 'GEPLANT',
+            note               TEXT,
+            ready_at           TEXT,
+            completed_at       TEXT,
+            source_key         TEXT,
+            created_by         TEXT,
+            screen_id          INTEGER,
+            countdown_enabled  INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY(location_id) REFERENCES locations(id)
         )
         """
     )
 
-    # Touren (neu: minute)
+    # Touren (minute + countdown_enabled)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS tours (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            name         TEXT NOT NULL,
-            weekday      TEXT NOT NULL,
-            hour         INTEGER NOT NULL,
-            minute       INTEGER NOT NULL DEFAULT 0,
-            location_id  INTEGER NOT NULL,
-            note         TEXT,
-            active       INTEGER NOT NULL DEFAULT 1,
-            screen_ids   TEXT,
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            name               TEXT NOT NULL,
+            weekday            TEXT NOT NULL,
+            hour               INTEGER NOT NULL,
+            minute             INTEGER NOT NULL DEFAULT 0,
+            location_id        INTEGER NOT NULL,
+            note               TEXT,
+            active             INTEGER NOT NULL DEFAULT 1,
+            screen_ids         TEXT,
+            countdown_enabled  INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(location_id) REFERENCES locations(id)
         )
         """
     )
 
-    # Tour-Stopps
+    # Tour-Stopps (mehrere Einrichtungen pro Tour)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS tour_stops (
@@ -230,7 +244,7 @@ def init_db(conn: sqlite3.Connection):
         """
     )
 
-    # Default Screens 1-7
+    # Default Screens 1-9
     cur.execute("SELECT COUNT(*) FROM screens")
     if cur.fetchone()[0] == 0:
         defaults = [
@@ -241,6 +255,8 @@ def init_db(conn: sqlite3.Connection):
             (5, "Übersicht Links",      "OVERVIEW", "ALLE", "", 20, 0, 0),
             (6, "Übersicht Rechts",     "OVERVIEW", "ALLE", "", 20, 0, 0),
             (7, "Lagerstand Übersicht", "WAREHOUSE","ALLE", "", 20, 0, 0),
+            (8, "Wareneingang 1",       "DETAIL",   "ALLE", "", 15, 0, 0),
+            (9, "Wareneingang 2",       "DETAIL",   "ALLE", "", 15, 0, 0),
         ]
         cur.executemany(
             """
@@ -251,15 +267,22 @@ def init_db(conn: sqlite3.Connection):
             defaults,
         )
     else:
-        cur.execute("SELECT COUNT(*) FROM screens WHERE id=7")
-        if cur.fetchone()[0] == 0:
-            cur.execute(
-                """
-                INSERT INTO screens
-                (id, name, mode, filter_type, filter_locations, refresh_interval_seconds, holiday_flag, special_flag)
-                VALUES (7, 'Lagerstand Übersicht', 'WAREHOUSE', 'ALLE', '', 20, 0, 0)
-                """
-            )
+        # sicherstellen, dass Screen 7/8/9 existieren (7 Warehouse, 8/9 Detail)
+        for sid, name, mode, refresh in [
+            (7, "Lagerstand Übersicht", "WAREHOUSE", 20),
+            (8, "Wareneingang 1",       "DETAIL",    15),
+            (9, "Wareneingang 2",       "DETAIL",    15),
+        ]:
+            cur.execute("SELECT COUNT(*) FROM screens WHERE id=?", (sid,))
+            if cur.fetchone()[0] == 0:
+                cur.execute(
+                    """
+                    INSERT INTO screens
+                    (id, name, mode, filter_type, filter_locations, refresh_interval_seconds, holiday_flag, special_flag)
+                    VALUES (?, ?, ?, 'ALLE', '', ?, 0, 0)
+                    """,
+                    (sid, name, mode, refresh),
+                )
 
     # Ticker Einträge sicherstellen
     cur.execute("SELECT id FROM screens")
@@ -275,7 +298,7 @@ def init_db(conn: sqlite3.Connection):
 
 def migrate_db(conn: sqlite3.Connection):
     """
-    Fügt fehlende Spalten/Indizes hinzu (alte DB-Versionen).
+    Fügt fehlende Spalten/Indizes hinzu und korrigiert Screen 8/9 als DETAIL (eigene Zonen).
     """
     cur = conn.cursor()
 
@@ -300,6 +323,8 @@ def migrate_db(conn: sqlite3.Connection):
             cur.execute("ALTER TABLE departures ADD COLUMN ready_at TEXT;")
         if "completed_at" not in deps:
             cur.execute("ALTER TABLE departures ADD COLUMN completed_at TEXT;")
+        if "countdown_enabled" not in deps:
+            cur.execute("ALTER TABLE departures ADD COLUMN countdown_enabled INTEGER NOT NULL DEFAULT 1;")
 
     locs = table_cols("locations")
     if locs:
@@ -314,6 +339,15 @@ def migrate_db(conn: sqlite3.Connection):
             cur.execute("ALTER TABLE tours ADD COLUMN screen_ids TEXT;")
         if "minute" not in tours:
             cur.execute("ALTER TABLE tours ADD COLUMN minute INTEGER NOT NULL DEFAULT 0;")
+        if "countdown_enabled" not in tours:
+            cur.execute("ALTER TABLE tours ADD COLUMN countdown_enabled INTEGER NOT NULL DEFAULT 0;")
+
+    # Screen 8/9: falls in Alt-DB als WAREHOUSE angelegt -> auf DETAIL setzen
+    try:
+        cur.execute("UPDATE screens SET mode='DETAIL' WHERE id IN (8,9) AND mode='WAREHOUSE';")
+        cur.execute("UPDATE screens SET refresh_interval_seconds=15 WHERE id IN (8,9) AND refresh_interval_seconds IS NULL;")
+    except Exception:
+        pass
 
     # Indizes
     try:
@@ -341,6 +375,7 @@ def get_connection():
     except Exception:
         pass
 
+    # Wenn DB korrupt, umbenennen und neu erstellen
     if not integrity_ok(conn):
         try:
             conn.close()
@@ -369,12 +404,11 @@ def get_connection():
 
     init_db(conn)
     migrate_db(conn)
-
     return conn
 
 
 # ==================================================
-# DB Helper (robust)
+# DB Helper
 # ==================================================
 
 def read_df(conn: sqlite3.Connection, query: str, params=()):
@@ -404,7 +438,18 @@ def load_departures_with_locations(conn):
                    d.status               AS status,
                    d.note                 AS note,
                    d.ready_at             AS ready_at,
-                   d.completed_at (response truncated for brevity in this message)
+                   d.completed_at         AS completed_at,
+                   d.source_key           AS source_key,
+                   d.created_by           AS created_by,
+                   d.screen_id            AS screen_id,
+                   d.countdown_enabled    AS countdown_enabled,
+                   l.name                 AS location_name,
+                   l.type                 AS location_type,
+                   l.active               AS location_active,
+                   l.color                AS location_color,
+                   l.text_color           AS location_text_color
+            FROM departures d
+            JOIN locations l ON d.location_id = l.id
             """,
         )
     except Exception:
@@ -422,6 +467,7 @@ def load_departures_with_locations(conn):
         "source_key": "",
         "created_by": "",
         "screen_id": None,
+        "countdown_enabled": 1,
         "location_name": "",
         "location_type": "",
         "location_active": 1,
@@ -438,6 +484,8 @@ def load_departures_with_locations(conn):
         df["ready_at"] = df["ready_at"].apply(lambda x: ensure_tz(x.to_pydatetime()) if pd.notnull(x) else x)
         df["completed_at"] = df["completed_at"].apply(lambda x: ensure_tz(x.to_pydatetime()) if pd.notnull(x) else x)
 
+        df["countdown_enabled"] = pd.to_numeric(df["countdown_enabled"], errors="coerce").fillna(1).astype(int)
+
     return df
 
 def load_tours(conn):
@@ -453,6 +501,7 @@ def load_tours(conn):
                t.note,
                t.active,
                t.screen_ids,
+               t.countdown_enabled,
                l.name AS location_name
         FROM tours t
         JOIN locations l ON t.location_id = l.id
@@ -560,16 +609,17 @@ def materialize_tours_to_departures(conn: sqlite3.Connection, create_window_hour
     df = read_df(
         conn,
         """
-        SELECT t.id         AS tour_id,
+        SELECT t.id                  AS tour_id,
                t.weekday,
                t.hour,
                t.minute,
-               t.note       AS tour_note,
-               t.active     AS tour_active,
-               t.screen_ids AS tour_screen_ids,
+               t.note                AS tour_note,
+               t.active              AS tour_active,
+               t.screen_ids          AS tour_screen_ids,
+               t.countdown_enabled   AS tour_countdown_enabled,
                ts.location_id,
                ts.position,
-               l.active     AS location_active
+               l.active              AS location_active
         FROM tours t
         JOIN tour_stops ts ON ts.tour_id = t.id
         JOIN locations l   ON l.id = ts.location_id
@@ -595,12 +645,14 @@ def materialize_tours_to_departures(conn: sqlite3.Connection, create_window_hour
 
         note = (r["tour_note"] or "").strip()
         screen_ids = parse_screen_ids(r["tour_screen_ids"])
+        tour_cd = int(pd.to_numeric(r.get("tour_countdown_enabled", 0), errors="coerce") or 0)
 
         if not screen_ids or weekday not in WEEKDAYS_DE:
             continue
 
         dep_dt = next_datetime_for_weekday_time(weekday, hour, minute)
 
+        # nur innerhalb Window materialisieren
         if dep_dt - now > window:
             continue
         if now - dep_dt > timedelta(days=1):
@@ -612,10 +664,10 @@ def materialize_tours_to_departures(conn: sqlite3.Connection, create_window_hour
                 execute_with_retry(
                     cur,
                     """
-                    INSERT INTO departures (datetime, location_id, vehicle, status, note, source_key, created_by, screen_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO departures (datetime, location_id, vehicle, status, note, source_key, created_by, screen_id, countdown_enabled)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (dep_dt.isoformat(), loc_id, "", "GEPLANT", note, source_key, "TOUR_AUTO", int(sid)),
+                    (dep_dt.isoformat(), loc_id, "", "GEPLANT", note, source_key, "TOUR_AUTO", int(sid), int(tour_cd)),
                 )
                 created_any = True
             except sqlite3.IntegrityError:
@@ -626,7 +678,331 @@ def materialize_tours_to_departures(conn: sqlite3.Connection, create_window_hour
 
 
 # ==================================================
-# Export/Import + Backup + CSV (Touren inkl. minute)
+# Screen Daten (nur Touren: nächste + übernächste)
+# ==================================================
+
+def get_screen_data(conn: sqlite3.Connection, screen_id: int):
+    screens = load_screens(conn)
+    if screens.empty or screen_id not in screens["id"].tolist():
+        return None, None
+
+    screen = screens.loc[screens["id"] == screen_id].iloc[0]
+    filter_type = screen["filter_type"] or "ALLE"
+    filter_locations = (screen["filter_locations"] or "").strip()
+
+    now = now_berlin()
+
+    deps = load_departures_with_locations(conn)
+    if deps.empty:
+        return screen, deps
+
+    # nur aktive Einrichtungen
+    deps = deps[deps["location_active"] == 1].copy()
+
+    # nur Abfahrten, die diesem Screen gehören (oder global)
+    deps = deps[(deps["screen_id"].isna()) | (deps["screen_id"] == int(screen_id))]
+
+    # Für die Monitore: nur TOUR-Einträge anzeigen
+    deps = deps[deps["source_key"].astype(str).str.startswith("TOUR:")]
+
+    # Filter
+    if filter_type != "ALLE":
+        deps = deps[deps["location_type"] == filter_type]
+
+    if filter_locations:
+        ids = [int(x.strip()) for x in filter_locations.split(",") if x.strip().isdigit()]
+        if ids:
+            deps = deps[deps["location_id"].isin(ids)]
+
+    # Status Sichtbarkeit / Zeitfenster
+    window_start = now - timedelta(minutes=AUTO_COMPLETE_AFTER_MIN)
+    deps = deps[deps["datetime"] >= window_start]
+
+    def visible(row):
+        status = str(row.get("status") or "").upper()
+        if status != "ABGESCHLOSSEN":
+            return True
+        if KEEP_COMPLETED_MINUTES <= 0:
+            return False
+        ca = row.get("completed_at")
+        dep_dt = ensure_tz(row["datetime"])
+        base = ensure_tz(ca) if pd.notnull(ca) else completion_deadline(dep_dt)
+        return now <= base + timedelta(minutes=KEEP_COMPLETED_MINUTES)
+
+    deps = deps[deps.apply(visible, axis=1)]
+
+    # Line Info: Countdown nur wenn countdown_enabled=1
+    def build_line_info(row):
+        cd_on = int(row.get("countdown_enabled", 1) or 1) == 1
+        if not cd_on:
+            return ""
+
+        status = str(row.get("status") or "").upper()
+        dep_dt = ensure_tz(row["datetime"])
+
+        if status == "GEPLANT":
+            delta = dep_dt - now
+            if timedelta(0) <= delta <= timedelta(hours=COUNTDOWN_START_HOURS):
+                return f"Countdown: {fmt_compact(delta)}"
+            return ""
+        if status == "BEREIT":
+            parts = []
+            ra = row.get("ready_at")
+            if pd.notnull(ra):
+                since = now - ensure_tz(ra)
+                parts.append(f"BEREIT seit {fmt_compact(since)}")
+            rem = completion_deadline(dep_dt) - now
+            parts.append(f"Abschluss in {fmt_compact(rem)}")
+            return " · ".join(parts)
+        return ""
+
+    deps["line_info"] = deps.apply(build_line_info, axis=1)
+
+    # Nächste + übernächste (zukunftsgerichtet)
+    future = deps[deps["datetime"] >= now].sort_values("datetime")
+    if future.empty:
+        deps = deps.sort_values("datetime").tail(2)
+    else:
+        deps = future.head(2)
+
+    return screen, deps
+
+
+# ==================================================
+# HTML Helpers
+# ==================================================
+
+def escape_html(text: str) -> str:
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def render_big_table(headers, rows, row_colors=None, text_colors=None):
+    thead = "".join(f"<th>{h}</th>" for h in headers)
+    body = ""
+    rows = list(rows)
+
+    for idx, r in enumerate(rows):
+        style_parts = []
+        if row_colors is not None and idx < len(row_colors):
+            bg = row_colors[idx] or ""
+            if bg:
+                style_parts.append(f"background-color:{bg};")
+        if text_colors is not None and idx < len(text_colors):
+            tc = text_colors[idx] or ""
+            if tc:
+                style_parts.append(f"color:{tc};")
+        style = f' style="{"".join(style_parts)}"' if style_parts else ""
+        tds = "".join(f"<td>{c}</td>" for c in r)
+        body += f"<tr{style}>{tds}</tr>"
+
+    st.markdown(
+        f"""
+        <table class="big-table">
+          <thead><tr>{thead}</tr></thead>
+          <tbody>{body}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ==================================================
+# Screen 7 Übersicht: Nächste + Übernächste Tour pro Zone (nur Zone A-D = 1-4)
+# ==================================================
+
+def get_next_two_departures_for_zone(conn: sqlite3.Connection, zone_screen_id: int):
+    now = now_berlin()
+    deps = load_departures_with_locations(conn)
+    if deps.empty:
+        return []
+
+    deps = deps[deps["location_active"] == 1].copy()
+    deps = deps[(deps["screen_id"] == int(zone_screen_id)) & (deps["source_key"].astype(str).str.startswith("TOUR:"))]
+    deps = deps[deps["datetime"] >= now].sort_values("datetime").head(2)
+
+    out = []
+    for _, r in deps.iterrows():
+        out.append({
+            "dt": ensure_tz(r["datetime"]),
+            "location": str(r["location_name"]),
+            "note": str(r.get("note") or ""),
+        })
+    return out
+
+
+# ==================================================
+# Display Mode
+# ==================================================
+
+def show_display_mode(screen_id: int):
+    st.markdown(
+        """
+        <style>
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+        .block-container { padding-top: 0.5rem; padding-bottom: 3.2rem; }
+        body, .block-container, .stMarkdown, .stText, .stDataFrame, div, span { font-size: 34px !important; }
+
+        .big-table { width: 100%; border-collapse: collapse; }
+        .big-table th, .big-table td {
+            border-bottom: 1px solid #555;
+            padding: 0.45em 0.9em;
+            text-align: left;
+            vertical-align: top;
+        }
+        .big-table th { font-weight: 800; }
+
+        .ticker {
+            position: fixed; bottom: 0; left: 0; width: 100%;
+            background: #000; color: #fff;
+            overflow: hidden; white-space: nowrap; z-index: 9999;
+            padding: 0.25rem 0;
+        }
+        .ticker__inner {
+            display: inline-block;
+            padding-left: 100%;
+            animation: ticker-scroll 20s linear infinite;
+            font-size: 28px !important;
+        }
+        @keyframes ticker-scroll { 0% { transform: translateX(0);} 100% { transform: translateX(-100%);} }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not screen_id:
+        st.error("Parameter 'screenId' fehlt oder ist ungültig.")
+        return
+
+    conn = get_connection()
+
+    materialize_tours_to_departures(conn, create_window_hours=MATERIALIZE_TOURS_HOURS_BEFORE)
+    update_departure_statuses(conn)
+
+    screens = load_screens(conn)
+    if screens.empty or int(screen_id) not in screens["id"].tolist():
+        st.error(f"Screen {screen_id} ist nicht konfiguriert.")
+        return
+
+    screen = screens.loc[screens["id"] == int(screen_id)].iloc[0]
+    interval_sec = int(screen.get("refresh_interval_seconds", 30))
+    st_autorefresh(interval=interval_sec * 1000, key=f"display_refresh_{screen_id}")
+
+    holiday_active = bool(screen.get("holiday_flag", 0))
+    special_active = bool(screen.get("special_flag", 0))
+
+    # Sonderplan/Feiertag: Vollbild
+    if holiday_active or special_active:
+        st.markdown("<style>body, .block-container { background-color:#000 !important; color:#fff !important; }</style>", unsafe_allow_html=True)
+        labels = []
+        if holiday_active:
+            labels.append("Feiertagsbelieferung")
+        if special_active:
+            labels.append("Sonderplan")
+        msg = " - ".join(l.upper() for l in labels)
+        st.markdown(
+            f"""
+            <div style="display:flex;justify-content:center;align-items:center;height:100vh;width:100%;
+                        background:#000;color:#fff;font-size:72px;font-weight:900;text-transform:uppercase;text-align:center;">
+              {msg}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    # Screen 7: Lagerstand Übersicht (Zone A-D: 1-4)
+    if int(screen["id"]) == 7 or str(screen.get("mode", "")).upper() == "WAREHOUSE":
+        st.markdown(f"## {screen['name']} (Screen {int(screen['id'])})")
+        st.caption(f"Aktualisierung alle {interval_sec} Sekunden • DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')}")
+
+        rows = []
+        for zid in [1, 2, 3, 4]:
+            zone_name = ZONE_NAME_MAP.get(zid, f"Screen {zid}")
+            nxt = get_next_two_departures_for_zone(conn, zid)
+            if not nxt:
+                rows.append([zone_name, "—", "—"])
+                continue
+
+            def fmt_item(item):
+                return f"{item['dt'].strftime('%a, %d.%m %H:%M')} – {escape_html(item['location'])}"
+
+            first = fmt_item(nxt[0]) if len(nxt) >= 1 else "—"
+            second = fmt_item(nxt[1]) if len(nxt) >= 2 else "—"
+            rows.append([zone_name, first, second])
+
+        render_big_table(["Zone", "Nächste Tour", "Übernächste Tour"], rows)
+
+        ticker = load_ticker_for_screen(conn, int(screen_id))
+        if ticker is not None and int(ticker["active"]) == 1 and (ticker["text"] or "").strip():
+            st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(ticker['text'])}</div></div>", unsafe_allow_html=True)
+        return
+
+    # DETAIL/OVERVIEW Screens (Zonen: 1-4, 8, 9)
+    st.markdown(f"## {screen['name']} (Screen {screen_id})")
+    st.caption(f"Modus: {screen['mode']} • DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')}")
+
+    screen_obj, data = get_screen_data(conn, int(screen_id))
+
+    if data is None or data.empty:
+        st.info("Keine Touren geplant.")
+    else:
+        # Zone-Screens: nur Einrichtung + Hinweis/Countdown; und Nächste + Übernächste (2 Zeilen)
+        if str(screen_obj["mode"]).upper() == "DETAIL" and int(screen_obj["id"]) in ZONE_SCREEN_IDS:
+            subset = data[["datetime", "location_name", "note", "line_info", "location_color", "location_text_color"]].copy()
+            subset["note"] = subset["note"].fillna("")
+            subset["line_info"] = subset["line_info"].fillna("")
+            subset["time"] = subset["datetime"].apply(lambda d: ensure_tz(d).strftime("%H:%M") if pd.notnull(d) else "")
+
+            def combine(r):
+                parts = [f"<b>{escape_html(r['time'])}</b>"]
+                if r["note"]:
+                    parts.append(escape_html(r["note"]))
+                if r["line_info"]:
+                    parts.append(escape_html(r["line_info"]))
+                return "<br/>".join([p for p in parts if p])
+
+            subset["combined"] = subset.apply(combine, axis=1)
+
+            rows = subset[["location_name", "combined"]].itertuples(index=False, name=None)
+            render_big_table(
+                ["Einrichtung", "Hinweis / Countdown"],
+                rows,
+                row_colors=subset["location_color"].fillna("").tolist(),
+                text_colors=subset["location_text_color"].fillna("").tolist(),
+            )
+        else:
+            # Overview: zeigt ebenfalls nur nächste + übernächste (wie gewünscht)
+            subset = data.copy()
+            for _, row in subset.iterrows():
+                note = (row.get("note") or "")
+                li = (row.get("line_info") or "")
+                dt = row.get("datetime")
+                tstr = ensure_tz(dt).strftime("%H:%M") if pd.notnull(dt) else ""
+                extra = ""
+                if note or li:
+                    extra = "<br/><span style='font-size:28px;'>" + escape_html(note)
+                    if note and li:
+                        extra += " · "
+                    extra += escape_html(li) + "</span>"
+
+                main = f"<b>{escape_html(tstr)} – {escape_html(row['location_name'])}</b>"
+                bg = row.get("location_color") or ""
+                tc = row.get("location_text_color") or ""
+                style = "margin-bottom:10px;"
+                if bg:
+                    style += f"background-color:{bg};padding:0.3em 0.5em;border-radius:0.2em;"
+                if tc:
+                    style += f"color:{tc};"
+                st.markdown(f"<div style='{style}'>{main}{extra}</div>", unsafe_allow_html=True)
+
+    ticker = load_ticker_for_screen(conn, int(screen_id))
+    if ticker is not None and int(ticker["active"]) == 1 and (ticker["text"] or "").strip():
+        st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(ticker['text'])}</div></div>", unsafe_allow_html=True)
+
+
+# ==================================================
+# Export/Import/Backup (Touren inkl. minute + countdown_enabled)
 # ==================================================
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -705,6 +1081,7 @@ def export_tours_json(conn) -> bytes:
             "note": str(t["note"] or ""),
             "active": int(t["active"]),
             "screen_ids": str(t["screen_ids"] or ""),
+            "countdown_enabled": int(t.get("countdown_enabled", 0) or 0),
             "primary_location_id": int(t["location_id"]),
             "primary_location_name": str(t["location_name"]),
             "stops": stops,
@@ -748,6 +1125,7 @@ def import_tours_json(conn, data: dict) -> tuple[int, int]:
         note = (t.get("note") or "").strip()
         active = 1 if int(t.get("active", 1)) == 1 else 0
         screen_ids = (t.get("screen_ids") or "").strip()
+        cd = 1 if int(t.get("countdown_enabled", 0) or 0) == 1 else 0
 
         if not name or weekday not in WEEKDAYS_DE or not (0 <= hour <= 23):
             continue
@@ -776,19 +1154,19 @@ def import_tours_json(conn, data: dict) -> tuple[int, int]:
                 cur.execute(
                     """
                     UPDATE tours
-                    SET name=?, weekday=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?
+                    SET name=?, weekday=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=?
                     WHERE id=?
                     """,
-                    (name, weekday, hour, minute, int(primary_loc_id), note, active, screen_ids, int(tour_id)),
+                    (name, weekday, hour, minute, int(primary_loc_id), note, active, screen_ids, cd, int(tour_id)),
                 )
                 updated += 1
             else:
                 cur.execute(
                     """
-                    INSERT INTO tours (id, name, weekday, hour, minute, location_id, note, active, screen_ids)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO tours (id, name, weekday, hour, minute, location_id, note, active, screen_ids, countdown_enabled)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (int(tour_id), name, weekday, hour, minute, int(primary_loc_id), note, active, screen_ids),
+                    (int(tour_id), name, weekday, hour, minute, int(primary_loc_id), note, active, screen_ids, cd),
                 )
                 inserted += 1
 
@@ -801,10 +1179,10 @@ def import_tours_json(conn, data: dict) -> tuple[int, int]:
         else:
             cur.execute(
                 """
-                INSERT INTO tours (name, weekday, hour, minute, location_id, note, active, screen_ids)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tours (name, weekday, hour, minute, location_id, note, active, screen_ids, countdown_enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (name, weekday, hour, minute, int(primary_loc_id), note, active, screen_ids),
+                (name, weekday, hour, minute, int(primary_loc_id), note, active, screen_ids, cd),
             )
             new_id = cur.lastrowid
             inserted += 1
@@ -839,12 +1217,15 @@ def export_locations_csv(conn) -> bytes:
 def export_tours_csv(conn) -> tuple[bytes, bytes]:
     tours = load_tours(conn)
     if tours.empty:
-        touren_df = pd.DataFrame(columns=["id", "name", "weekday", "hour", "minute", "note", "active", "screen_ids", "location_id", "primary_location_name"])
+        touren_df = pd.DataFrame(columns=[
+            "id", "name", "weekday", "hour", "minute", "note", "active", "screen_ids", "countdown_enabled",
+            "location_id", "primary_location_name"
+        ])
         stops_df = pd.DataFrame(columns=["tour_id", "position", "location_id", "location_name"])
         return df_to_csv_bytes(touren_df), df_to_csv_bytes(stops_df)
 
     touren_out = tours.rename(columns={"location_name": "primary_location_name"})[
-        ["id", "name", "weekday", "hour", "minute", "note", "active", "screen_ids", "location_id", "primary_location_name"]
+        ["id", "name", "weekday", "hour", "minute", "note", "active", "screen_ids", "countdown_enabled", "location_id", "primary_location_name"]
     ].copy()
 
     stops_rows = []
@@ -862,299 +1243,6 @@ def export_tours_csv(conn) -> tuple[bytes, bytes]:
             })
     stops_df = pd.DataFrame(stops_rows, columns=["tour_id", "position", "location_id", "location_name"])
     return df_to_csv_bytes(touren_out), df_to_csv_bytes(stops_df)
-
-
-# ==================================================
-# Display Mode (Screens) – unverändert bis auf Tour-Zeitberechnung
-# ==================================================
-
-def escape_html(text: str) -> str:
-    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-def render_big_table(headers, rows, row_colors=None, text_colors=None):
-    thead = "".join(f"<th>{h}</th>" for h in headers)
-    body = ""
-    rows = list(rows)
-
-    for idx, r in enumerate(rows):
-        style_parts = []
-        if row_colors is not None and idx < len(row_colors):
-            bg = row_colors[idx] or ""
-            if bg:
-                style_parts.append(f"background-color:{bg};")
-        if text_colors is not None and idx < len(text_colors):
-            tc = text_colors[idx] or ""
-            if tc:
-                style_parts.append(f"color:{tc};")
-        style = f' style="{"".join(style_parts)}"' if style_parts else ""
-        tds = "".join(f"<td>{c}</td>" for c in r)
-        body += f"<tr{style}>{tds}</tr>"
-
-    st.markdown(
-        f"""
-        <table class="big-table">
-          <thead><tr>{thead}</tr></thead>
-          <tbody>{body}</tbody>
-        </table>
-        """,
-        unsafe_allow_html=True,
-    )
-
-def get_next_tour_for_screen(conn: sqlite3.Connection, screen_id: int):
-    tours = load_tours(conn)
-    if tours.empty:
-        return None
-
-    tours = tours[(tours["active"] == 1)]
-    tours = tours[tours["screen_ids"].apply(lambda v: screen_id in parse_screen_ids(v))]
-    if tours.empty:
-        return None
-
-    best_row = None
-    best_dt = None
-    for _, t in tours.iterrows():
-        try:
-            dt = next_datetime_for_weekday_time(str(t["weekday"]), int(t["hour"]), int(t.get("minute", 0) or 0))
-        except Exception:
-            continue
-        if best_dt is None or dt < best_dt:
-            best_dt = dt
-            best_row = t
-
-    if best_row is None:
-        return None
-
-    stops_df = load_tour_stops(conn, int(best_row["id"]))
-    stops = stops_df["location_name"].tolist() if not stops_df.empty else [str(best_row.get("location_name") or "")]
-
-    return {
-        "tour_id": int(best_row["id"]),
-        "tour_name": str(best_row["name"]),
-        "next_dt": best_dt,
-        "stops": [s for s in stops if s],
-        "note": str(best_row.get("note") or ""),
-    }
-
-def get_screen_data(conn: sqlite3.Connection, screen_id: int):
-    screens = load_screens(conn)
-    if screens.empty or screen_id not in screens["id"].tolist():
-        return None, None
-
-    screen = screens.loc[screens["id"] == screen_id].iloc[0]
-    filter_type = screen["filter_type"] or "ALLE"
-    filter_locations = (screen["filter_locations"] or "").strip()
-
-    now = now_berlin()
-
-    deps = load_departures_with_locations(conn)
-    if deps.empty:
-        return screen, deps
-
-    if "location_active" in deps.columns:
-        deps = deps[deps["location_active"] == 1].copy()
-
-    if "screen_id" in deps.columns:
-        deps = deps[(deps["screen_id"].isna()) | (deps["screen_id"] == int(screen_id))]
-
-    window_start = now - timedelta(minutes=AUTO_COMPLETE_AFTER_MIN)
-    if "datetime" in deps.columns:
-        deps = deps[deps["datetime"] >= window_start]
-
-    def visible(row):
-        status = str(row.get("status") or "").upper()
-        if status != "ABGESCHLOSSEN":
-            return True
-        if KEEP_COMPLETED_MINUTES <= 0:
-            return False
-        ca = row.get("completed_at")
-        dep_dt = ensure_tz(row["datetime"])
-        base = ensure_tz(ca) if pd.notnull(ca) else completion_deadline(dep_dt)
-        return now <= base + timedelta(minutes=KEEP_COMPLETED_MINUTES)
-
-    deps = deps[deps.apply(visible, axis=1)]
-
-    if filter_type != "ALLE" and "location_type" in deps.columns:
-        deps = deps[deps["location_type"] == filter_type]
-
-    if filter_locations:
-        ids = [int(x.strip()) for x in filter_locations.split(",") if x.strip().isdigit()]
-        if ids and "location_id" in deps.columns:
-            deps = deps[deps["location_id"].isin(ids)]
-
-    def build_line_info(row):
-        status = str(row.get("status") or "").upper()
-        dep_dt = ensure_tz(row["datetime"])
-
-        if status == "GEPLANT":
-            delta = dep_dt - now
-            if timedelta(0) <= delta <= timedelta(hours=COUNTDOWN_START_HOURS):
-                return f"Countdown: {fmt_compact(delta)}"
-            return ""
-        if status == "BEREIT":
-            parts = []
-            ra = row.get("ready_at")
-            if pd.notnull(ra):
-                since = now - ensure_tz(ra)
-                parts.append(f"BEREIT seit {fmt_compact(since)}")
-            rem = completion_deadline(dep_dt) - now
-            parts.append(f"Abschluss in {fmt_compact(rem)}")
-            return " · ".join(parts)
-        return ""
-
-    deps["line_info"] = deps.apply(build_line_info, axis=1)
-    deps = deps.sort_values("datetime")
-    return screen, deps
-
-def show_display_mode(screen_id: int):
-    st.markdown(
-        """
-        <style>
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
-        header {visibility: hidden;}
-        .block-container { padding-top: 0.5rem; padding-bottom: 3.2rem; }
-        body, .block-container, .stMarkdown, .stText, .stDataFrame, div, span { font-size: 32px !important; }
-
-        .big-table { width: 100%; border-collapse: collapse; }
-        .big-table th, .big-table td {
-            border-bottom: 1px solid #555;
-            padding: 0.4em 0.8em;
-            text-align: left;
-            vertical-align: top;
-        }
-        .big-table th { font-weight: 800; }
-
-        .ticker {
-            position: fixed; bottom: 0; left: 0; width: 100%;
-            background: #000; color: #fff;
-            overflow: hidden; white-space: nowrap; z-index: 9999;
-            padding: 0.25rem 0;
-        }
-        .ticker__inner {
-            display: inline-block;
-            padding-left: 100%;
-            animation: ticker-scroll 20s linear infinite;
-            font-size: 28px !important;
-        }
-        @keyframes ticker-scroll { 0% { transform: translateX(0);} 100% { transform: translateX(-100%);} }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if not screen_id:
-        st.error("Parameter 'screenId' fehlt oder ist ungültig.")
-        return
-
-    conn = get_connection()
-
-    materialize_tours_to_departures(conn, create_window_hours=MATERIALIZE_TOURS_HOURS_BEFORE)
-    update_departure_statuses(conn)
-
-    screens = load_screens(conn)
-    if screens.empty or int(screen_id) not in screens["id"].tolist():
-        st.error(f"Screen {screen_id} ist nicht konfiguriert.")
-        return
-
-    screen = screens.loc[screens["id"] == int(screen_id)].iloc[0]
-    interval_sec = int(screen.get("refresh_interval_seconds", 30))
-    st_autorefresh(interval=interval_sec * 1000, key=f"display_refresh_{screen_id}")
-
-    holiday_active = bool(screen.get("holiday_flag", 0))
-    special_active = bool(screen.get("special_flag", 0))
-
-    if holiday_active or special_active:
-        st.markdown("<style>body, .block-container { background-color:#000 !important; color:#fff !important; }</style>", unsafe_allow_html=True)
-        labels = []
-        if holiday_active:
-            labels.append("Feiertagsbelieferung")
-        if special_active:
-            labels.append("Sonderplan")
-        msg = " - ".join(l.upper() for l in labels)
-        st.markdown(
-            f"""
-            <div style="display:flex;justify-content:center;align-items:center;height:100vh;width:100%;
-                        background:#000;color:#fff;font-size:72px;font-weight:900;text-transform:uppercase;text-align:center;">
-              {msg}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
-
-    if int(screen["id"]) == 7 or str(screen.get("mode", "")).upper() == "WAREHOUSE":
-        st.markdown(f"## {screen['name']} (Screen 7)")
-        st.caption(f"Aktualisierung alle {interval_sec} Sekunden • DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')}")
-
-        rows = []
-        for sid in [1, 2, 3, 4]:
-            info = get_next_tour_for_screen(conn, sid)
-            if not info:
-                rows.append([f"Screen {sid}", "—", "—", "—"])
-                continue
-            dt_str = info["next_dt"].strftime("%a, %d.%m %H:%M")
-            stops = ", ".join(info["stops"][:10]) + (" …" if len(info["stops"]) > 10 else "")
-            rows.append([f"Screen {sid}", dt_str, info["tour_name"], stops])
-
-        render_big_table(["Zone/Screen", "Nächste Tour", "Tour", "Stops"], rows)
-
-        ticker = load_ticker_for_screen(conn, 7)
-        if ticker is not None and int(ticker["active"]) == 1 and (ticker["text"] or "").strip():
-            st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(ticker['text'])}</div></div>", unsafe_allow_html=True)
-        return
-
-    st.markdown(f"## {screen['name']} (Screen {screen_id})")
-    st.caption(f"Modus: {screen['mode']} • DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')}")
-
-    screen_obj, data = get_screen_data(conn, int(screen_id))
-
-    if data is None or data.empty:
-        st.info("Keine Abfahrten.")
-    else:
-        if str(screen_obj["mode"]).upper() == "DETAIL" and int(screen_obj["id"]) in [1, 2, 3, 4]:
-            subset = data[["location_name", "note", "line_info", "location_color", "location_text_color"]].copy()
-            subset["note"] = subset["note"].fillna("")
-            subset["line_info"] = subset["line_info"].fillna("")
-            subset["combined"] = subset.apply(
-                lambda r: (r["note"] + ("<br/>" if r["note"] and r["line_info"] else "") + r["line_info"]),
-                axis=1,
-            )
-            rows = subset[["location_name", "combined"]].itertuples(index=False, name=None)
-            render_big_table(
-                ["Einrichtung", "Hinweis / Countdown"],
-                rows,
-                row_colors=subset["location_color"].fillna("").tolist(),
-                text_colors=subset["location_text_color"].fillna("").tolist(),
-            )
-        else:
-            grouped = list(data.groupby("location_type")) if "location_type" in data.columns else [("Alle", data)]
-            cols = st.columns(3)
-            for idx, (typ, group) in enumerate(grouped):
-                with cols[idx % 3]:
-                    st.markdown(f"### {typ}")
-                    for _, row in group.head(12).iterrows():
-                        note = (row.get("note") or "")
-                        li = (row.get("line_info") or "")
-                        extra = ""
-                        if note or li:
-                            extra = "<br/><span style='font-size:28px;'>" + escape_html(note)
-                            if note and li:
-                                extra += " · "
-                            extra += escape_html(li) + "</span>"
-
-                        main = f"<b>{escape_html(row['location_name'])}</b>"
-                        bg = row.get("location_color") or ""
-                        tc = row.get("location_text_color") or ""
-                        style = "margin-bottom:10px;"
-                        if bg:
-                            style += f"background-color:{bg};padding:0.3em 0.5em;border-radius:0.2em;"
-                        if tc:
-                            style += f"color:{tc};"
-                        st.markdown(f"<div style='{style}'>{main}{extra}</div>", unsafe_allow_html=True)
-
-    ticker = load_ticker_for_screen(conn, int(screen_id))
-    if ticker is not None and int(ticker["active"]) == 1 and (ticker["text"] or "").strip():
-        st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(ticker['text'])}</div></div>", unsafe_allow_html=True)
 
 
 # ==================================================
@@ -1275,102 +1363,44 @@ def show_admin_locations(conn, can_edit: bool):
 
 
 # ==================================================
-# Admin: Abfahrten (manuell) + Löschen
+# Admin: Abfahrten (nur Anzeige / Löschen)
 # ==================================================
 
 def show_admin_departures(conn, can_edit: bool):
-    st.subheader("Abfahrten")
+    st.subheader("Abfahrten (materialisiert aus Touren)")
 
     materialize_tours_to_departures(conn, create_window_hours=MATERIALIZE_TOURS_HOURS_BEFORE)
     update_departure_statuses(conn)
 
-    locations = load_locations(conn)
-    screens = load_screens(conn)
-    if locations.empty:
-        st.warning("Bitte zuerst mindestens eine Einrichtung anlegen.")
+    deps = load_departures_with_locations(conn)
+    deps = deps[deps["source_key"].astype(str).str.startswith("TOUR:")].sort_values("datetime")
+
+    if deps.empty:
+        st.info("Noch keine Abfahrten (Touren) vorhanden.")
         return
 
-    if can_edit:
-        st.markdown("### Neue Abfahrt anlegen (manuell)")
-        with st.form("new_departure"):
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                weekday = st.selectbox("Wochentag", WEEKDAYS_DE)
-            with col2:
-                opts = time_options_half_hour()
-                time_label = st.selectbox("Uhrzeit (00/30)", opts, index=opts.index("08:00") if "08:00" in opts else 0)
-                hour_int, minute_int = map(int, time_label.split(":"))
-            with col3:
-                loc_id = st.selectbox(
-                    "Einrichtung",
-                    options=locations["id"].tolist(),
-                    format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
-                )
-            with col4:
-                screen_id = st.selectbox(
-                    "Ziel-Screen (optional)",
-                    options=[None] + screens["id"].tolist(),
-                    format_func=lambda x: "Global (alle)" if x is None else f"Screen {int(x)}",
-                )
-
-            note = st.text_input("Hinweis (optional)", "")
-            submitted = st.form_submit_button("Speichern")
-
-        if submitted:
-            dt = next_datetime_for_weekday_time(weekday, hour_int, minute_int)
-            conn.execute(
-                """
-                INSERT INTO departures (datetime, location_id, vehicle, status, note, created_by, screen_id)
-                VALUES (?, ?, '', 'GEPLANT', ?, ?, ?)
-                """,
-                (dt.isoformat(), int(loc_id), note.strip(),
-                 st.session_state.get("username", "MANUAL"),
-                 int(screen_id) if screen_id is not None else None),
-            )
-            conn.commit()
-            st.success(f"Abfahrt gespeichert: {dt.strftime('%Y-%m-%d %H:%M')}")
-            st.rerun()
+    st.dataframe(
+        deps[["datetime", "screen_id", "location_name", "note", "status", "countdown_enabled", "source_key"]].copy(),
+        use_container_width=True
+    )
 
     st.markdown("---")
-    st.markdown("### Bestehende Abfahrten (inkl. Tour-Auto)")
-    deps = load_departures_with_locations(conn)
-    if deps.empty:
-        st.info("Noch keine Abfahrten vorhanden.")
+    st.markdown("### Löschen (nur Admin)")
+    if not can_edit:
+        st.info("Keine Löschrechte.")
         return
 
-    deps = deps.sort_values("datetime")
-
-    for _, row in deps.iterrows():
-        dt_str = row["datetime"].strftime("%Y-%m-%d %H:%M") if pd.notnull(row["datetime"]) else "-"
-        sk = (row.get("source_key") or "")
-        auto_tag = " (Tour-Auto)" if sk.startswith("TOUR:") else ""
-        sid = row.get("screen_id")
-        sid_txt = "Global" if pd.isna(sid) else f"Screen {int(sid)}"
-
-        with st.container():
-            c1, c2 = st.columns([4, 1])
-            with c1:
-                st.markdown(f"**{dt_str} – {row['location_name']} ({row['location_type']})**{auto_tag}")
-                lines = [f"Screen: {sid_txt}", f"Status: {row.get('status')}"]
-                if row.get("note"):
-                    lines.append(f"Hinweis: {row.get('note')}")
-                if row.get("created_by"):
-                    lines.append(f"Erstellt durch: {row.get('created_by')}")
-                st.markdown("<br>".join(lines), unsafe_allow_html=True)
-
-            with c2:
-                if can_edit:
-                    if st.button("Löschen", key=f"del_dep_{row['id']}"):
-                        conn.execute("DELETE FROM departures WHERE id=?", (int(row["id"]),))
-                        conn.commit()
-                        st.success("Abfahrt gelöscht.")
-                        st.rerun()
-                else:
-                    st.caption("Keine Löschrechte")
+    ids = deps["id"].tolist()
+    del_id = st.selectbox("Abfahrt auswählen", ids, format_func=lambda i: f"ID {i}", key="del_dep_pick")
+    if st.button("Ausgewählte Abfahrt löschen"):
+        conn.execute("DELETE FROM departures WHERE id=?", (int(del_id),))
+        conn.commit()
+        st.success("Abfahrt gelöscht.")
+        st.rerun()
 
 
 # ==================================================
-# Admin: Touren (Stops + Screen-Zuweisung) + Import/Export
+# Admin: Touren (Stops + Screen-Zuweisung + Countdown-Haken)
 # ==================================================
 
 def show_admin_tours(conn, can_edit: bool):
@@ -1396,8 +1426,9 @@ def show_admin_tours(conn, can_edit: bool):
         view["Monitore"] = view["screen_ids"].apply(
             lambda s: ", ".join([f"{i}:{screen_map.get(i, f'Screen {i}')}" for i in parse_screen_ids(s)])
         )
+        view["Countdown"] = view["countdown_enabled"].apply(lambda v: "Ja" if int(v) == 1 else "Nein")
         st.dataframe(
-            view[["id", "name", "weekday", "Zeit", "location_name", "note", "active", "Monitore"]],
+            view[["id", "name", "weekday", "Zeit", "Countdown", "location_name", "note", "active", "Monitore"]],
             use_container_width=True
         )
 
@@ -1445,6 +1476,8 @@ def show_admin_tours(conn, can_edit: bool):
                 format_func=lambda sid: f"{sid}: {screen_map.get(sid)}",
             )
 
+        countdown_enabled = st.checkbox("Countdown für diese Tour aktiv", value=False)
+
         stops_new = st.multiselect(
             "Einrichtungen (Stops)",
             options=loc_options,
@@ -1469,10 +1502,11 @@ def show_admin_tours(conn, can_edit: bool):
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO tours (name, weekday, hour, minute, location_id, note, active, screen_ids)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tours (name, weekday, hour, minute, location_id, note, active, screen_ids, countdown_enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (tour_name.strip(), weekday, hour_int, minute_int, primary_loc, note_new.strip(), 1 if active_new else 0, screen_ids_str),
+                (tour_name.strip(), weekday, hour_int, minute_int, primary_loc, note_new.strip(),
+                 1 if active_new else 0, screen_ids_str, 1 if countdown_enabled else 0),
             )
             tour_id = cur.lastrowid
 
@@ -1521,6 +1555,8 @@ def show_admin_tours(conn, can_edit: bool):
                 default=existing_screen_ids,
             )
 
+        countdown_edit = st.checkbox("Countdown für diese Tour aktiv", value=(int(row.get("countdown_enabled", 0) or 0) == 1))
+
         stops_edit = st.multiselect(
             "Einrichtungen (Stops)",
             options=loc_options,
@@ -1549,11 +1585,11 @@ def show_admin_tours(conn, can_edit: bool):
             cur.execute(
                 """
                 UPDATE tours
-                SET name=?, weekday=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?
+                SET name=?, weekday=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=?
                 WHERE id=?
                 """,
                 (name_edit.strip(), weekday_edit, hour_edit, minute_edit, primary_loc, note_edit.strip(),
-                 1 if active_edit else 0, screen_ids_str, int(selected)),
+                 1 if active_edit else 0, screen_ids_str, 1 if countdown_edit else 0, int(selected)),
             )
             cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(selected),))
             for pos, loc_id in enumerate(stops_edit):
@@ -1731,7 +1767,8 @@ def show_admin_mode():
                 view["Monitore"] = view["screen_ids"].apply(
                     lambda s: ", ".join([f"{i}:{screen_map.get(i, f'Screen {i}')}" for i in parse_screen_ids(s)])
                 )
-                st.dataframe(view[["id", "name", "weekday", "Zeit", "location_name", "note", "active", "Monitore"]],
+                view["Countdown"] = view["countdown_enabled"].apply(lambda v: "Ja" if int(v) == 1 else "Nein")
+                st.dataframe(view[["id", "name", "weekday", "Zeit", "Countdown", "location_name", "note", "active", "Monitore"]],
                              use_container_width=True)
 
 
