@@ -345,7 +345,6 @@ def migrate_db(conn: sqlite3.Connection):
     # Screen 8/9: falls in Alt-DB als WAREHOUSE angelegt -> auf DETAIL setzen
     try:
         cur.execute("UPDATE screens SET mode='DETAIL' WHERE id IN (8,9) AND mode='WAREHOUSE';")
-        cur.execute("UPDATE screens SET refresh_interval_seconds=15 WHERE id IN (8,9) AND refresh_interval_seconds IS NULL;")
     except Exception:
         pass
 
@@ -678,7 +677,7 @@ def materialize_tours_to_departures(conn: sqlite3.Connection, create_window_hour
 
 
 # ==================================================
-# Screen Daten (nur Touren: nächste + übernächste)
+# Screen Daten (nur Touren: alle zukünftigen, die zu diesem Screen gehören)
 # ==================================================
 
 def get_screen_data(conn: sqlite3.Connection, screen_id: int):
@@ -758,12 +757,12 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
 
     deps["line_info"] = deps.apply(build_line_info, axis=1)
 
-    # Nächste + übernächste (zukunftsgerichtet)
+    # Alle zukünftigen (falls keine zukünftigen: alles Sichtbare, sortiert)
     future = deps[deps["datetime"] >= now].sort_values("datetime")
     if future.empty:
-        deps = deps.sort_values("datetime").tail(2)
+        deps = deps.sort_values("datetime")
     else:
-        deps = future.head(2)
+        deps = future
 
     return screen, deps
 
@@ -806,7 +805,7 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None):
 
 
 # ==================================================
-# Screen 7 Übersicht: Nächste + Übernächste Tour pro Zone (nur Zone A-D = 1-4)
+# Screen 7 Übersicht: Nächste + Übernächste Tour pro Zone (Zone A-D + Wareneingang 1/2)
 # ==================================================
 
 def get_next_two_departures_for_zone(conn: sqlite3.Connection, zone_screen_id: int):
@@ -911,13 +910,13 @@ def show_display_mode(screen_id: int):
         )
         return
 
-    # Screen 7: Lagerstand Übersicht (Zone A-D: 1-4)
+    # Screen 7: Lagerstand Übersicht (Zone A-D + Wareneingang 1/2)
     if int(screen["id"]) == 7 or str(screen.get("mode", "")).upper() == "WAREHOUSE":
         st.markdown(f"## {screen['name']} (Screen {int(screen['id'])})")
         st.caption(f"Aktualisierung alle {interval_sec} Sekunden • DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')}")
 
         rows = []
-        for zid in [1, 2, 3, 4]:
+        for zid in [1, 2, 3, 4, 8, 9]:
             zone_name = ZONE_NAME_MAP.get(zid, f"Screen {zid}")
             nxt = get_next_two_departures_for_zone(conn, zid)
             if not nxt:
@@ -947,7 +946,7 @@ def show_display_mode(screen_id: int):
     if data is None or data.empty:
         st.info("Keine Touren geplant.")
     else:
-        # Zone-Screens: nur Einrichtung + Hinweis/Countdown; und Nächste + Übernächste (2 Zeilen)
+        # Zone-Screens: Tabelle (mehrere Zeilen möglich)
         if str(screen_obj["mode"]).upper() == "DETAIL" and int(screen_obj["id"]) in ZONE_SCREEN_IDS:
             subset = data[["datetime", "location_name", "note", "line_info", "location_color", "location_text_color"]].copy()
             subset["note"] = subset["note"].fillna("")
@@ -972,7 +971,7 @@ def show_display_mode(screen_id: int):
                 text_colors=subset["location_text_color"].fillna("").tolist(),
             )
         else:
-            # Overview: zeigt ebenfalls nur nächste + übernächste (wie gewünscht)
+            # Overview: ebenfalls alle zukünftigen Touren für diesen Screen
             subset = data.copy()
             for _, row in subset.iterrows():
                 note = (row.get("note") or "")
