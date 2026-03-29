@@ -1,4 +1,3 @@
-# streamlit_app.py
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -6,9 +5,10 @@ import json
 import io
 import time
 import uuid
-from datetime import datetime, timedelta, time as dtime, date
+from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from contextlib import contextmanager
 
 from streamlit_autorefresh import st_autorefresh
 
@@ -21,28 +21,30 @@ st.set_page_config(page_title="Abfahrten", layout="wide")
 DB_PATH = Path("abfahrten.db")
 TZ = ZoneInfo("Europe/Berlin")
 
-# Login (einfach, lokal in Code)
-USERS = {
+# Optional über .streamlit/secrets.toml überschreibbar:
+# [users.admin]
+# password = "deinpasswort"
+# role = "admin"
+#
+# [users.dispo]
+# password = "deinpasswort"
+# role = "viewer"
+DEFAULT_USERS = {
     "admin": {"password": "admin123", "role": "admin"},
-    "dispo": {"password": "dispo123", "role": "viewer"},  # darf sehen, aber nicht löschen/importieren/ändern
+    "dispo": {"password": "dispo123", "role": "viewer"},
 }
 
 WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
 WEEKDAY_TO_INT = {name: i for i, name in enumerate(WEEKDAYS_DE)}  # Montag=0
 
-# Countdown beginnt 3 Stunden vorher (wenn in der Tour aktiviert)
 COUNTDOWN_START_HOURS = 3
-
-# Status-Automatik (gilt für Touren- und manuelle Abfahrten)
 AUTO_COMPLETE_AFTER_MIN = 20
 KEEP_COMPLETED_MINUTES = 10
 
-# Touren werden automatisch zu echten Abfahrten materialisiert
-# UND: Touren sollen 12 Stunden vor Abfahrt auf Screens erscheinen
 MATERIALIZE_TOURS_HOURS_BEFORE = 12
-DISPLAY_WINDOW_HOURS = 12  # Anzeige-Fenster für Screens: jetzt .. +12h
+DISPLAY_WINDOW_HOURS = 12
 
-ZONE_SCREEN_IDS = [1, 2, 3, 4, 8, 9]  # Zone A-D + Wareneingang 1/2
+ZONE_SCREEN_IDS = [1, 2, 3, 4, 8, 9]
 ZONE_NAME_MAP = {
     1: "Zone A",
     2: "Zone B",
@@ -52,6 +54,59 @@ ZONE_NAME_MAP = {
     9: "Wareneingang 2",
 }
 
+
+# ==================================================
+# Benutzer / Auth
+# ==================================================
+
+def get_users():
+    try:
+        secrets_users = st.secrets.get("users", None)
+        if secrets_users:
+            out = {}
+            for username, data in secrets_users.items():
+                out[str(username)] = {
+                    "password": str(data.get("password", "")),
+                    "role": str(data.get("role", "viewer")),
+                }
+            if out:
+                return out
+    except Exception:
+        pass
+    return DEFAULT_USERS
+
+
+def require_admin():
+    if st.session_state.get("role") != "admin":
+        st.error("Nur Admin darf diese Aktion ausführen.")
+        st.stop()
+
+
+def require_login():
+    if st.session_state.get("logged_in"):
+        return
+
+    st.title("Login")
+    with st.form("login_form"):
+        username = st.text_input("Benutzername")
+        password = st.text_input("Passwort", type="password")
+        submitted = st.form_submit_button("Einloggen")
+
+    if submitted:
+        users = get_users()
+        user_entry = users.get(username)
+        if user_entry and user_entry["password"] == password:
+            st.session_state["logged_in"] = True
+            st.session_state["role"] = user_entry["role"]
+            st.session_state["username"] = username
+            st.success("Erfolgreich eingeloggt.")
+            st.rerun()
+        else:
+            st.error("Benutzername oder Passwort ist falsch.")
+
+    st.stop()
+
+
 # ==================================================
 # Zeit Helpers (DE Ortszeit)
 # ==================================================
@@ -59,12 +114,14 @@ ZONE_NAME_MAP = {
 def now_berlin() -> datetime:
     return datetime.now(TZ)
 
-def ensure_tz(dt: datetime) -> datetime:
+
+def ensure_tz(dt: datetime):
     if dt is None:
         return None
     if dt.tzinfo is None:
         return dt.replace(tzinfo=TZ)
     return dt.astimezone(TZ)
+
 
 def next_datetime_for_weekday_time(weekday_name: str, hour: int, minute: int) -> datetime:
     now = now_berlin()
@@ -80,6 +137,7 @@ def next_datetime_for_weekday_time(weekday_name: str, hour: int, minute: int) ->
 
     return candidate_dt
 
+
 def fmt_compact(td: timedelta) -> str:
     total = int(td.total_seconds())
     if total < 0:
@@ -91,38 +149,26 @@ def fmt_compact(td: timedelta) -> str:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
+
 def completion_deadline(dep_dt: datetime) -> datetime:
     return dep_dt + timedelta(minutes=AUTO_COMPLETE_AFTER_MIN)
+
 
 def time_options_half_hour():
     return [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
 
-# ==================================================
-# Login
-# ==================================================
 
-def require_login():
-    if st.session_state.get("logged_in"):
-        return
+def to_int(value, default=0):
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    try:
+        return int(float(value))
+    except Exception:
+        return default
 
-    st.title("Login")
-    with st.form("login_form"):
-        username = st.text_input("Benutzername")
-        password = st.text_input("Passwort", type="password")
-        submitted = st.form_submit_button("Einloggen")
-
-    if submitted:
-        user_entry = USERS.get(username)
-        if user_entry and user_entry["password"] == password:
-            st.session_state["logged_in"] = True
-            st.session_state["role"] = user_entry["role"]
-            st.session_state["username"] = username
-            st.success("Erfolgreich eingeloggt.")
-            st.rerun()
-        else:
-            st.error("Benutzername oder Passwort ist falsch.")
-
-    st.stop()
 
 # ==================================================
 # DB Robustness / Migration
@@ -137,7 +183,8 @@ def integrity_ok(conn: sqlite3.Connection) -> bool:
     except Exception:
         return False
 
-def execute_with_retry(cur: sqlite3.Cursor, sql: str, params: tuple, retries: int = 6):
+
+def execute_with_retry(cur: sqlite3.Cursor, sql: str, params: tuple = (), retries: int = 6):
     for i in range(retries):
         try:
             cur.execute(sql, params)
@@ -148,6 +195,7 @@ def execute_with_retry(cur: sqlite3.Cursor, sql: str, params: tuple, retries: in
                 time.sleep(0.25 * (i + 1))
                 continue
             raise
+
 
 def init_db(conn: sqlite3.Connection):
     cur = conn.cursor()
@@ -244,15 +292,15 @@ def init_db(conn: sqlite3.Connection):
     cur.execute("SELECT COUNT(*) FROM screens")
     if cur.fetchone()[0] == 0:
         defaults = [
-            (1, "Zone A",               "DETAIL",   "ALLE", "", 15, 0, 0),
-            (2, "Zone B",               "DETAIL",   "ALLE", "", 15, 0, 0),
-            (3, "Zone C",               "DETAIL",   "ALLE", "", 15, 0, 0),
-            (4, "Zone D",               "DETAIL",   "ALLE", "", 15, 0, 0),
-            (5, "Übersicht Links",      "OVERVIEW", "ALLE", "", 20, 0, 0),
-            (6, "Übersicht Rechts",     "OVERVIEW", "ALLE", "", 20, 0, 0),
-            (7, "Lagerstand Übersicht", "WAREHOUSE","ALLE", "", 20, 0, 0),
-            (8, "Wareneingang 1",       "DETAIL",   "ALLE", "", 15, 0, 0),
-            (9, "Wareneingang 2",       "DETAIL",   "ALLE", "", 15, 0, 0),
+            (1, "Zone A",               "DETAIL",    "ALLE", "", 15, 0, 0),
+            (2, "Zone B",               "DETAIL",    "ALLE", "", 15, 0, 0),
+            (3, "Zone C",               "DETAIL",    "ALLE", "", 15, 0, 0),
+            (4, "Zone D",               "DETAIL",    "ALLE", "", 15, 0, 0),
+            (5, "Übersicht Links",      "OVERVIEW",  "ALLE", "", 20, 0, 0),
+            (6, "Übersicht Rechts",     "OVERVIEW",  "ALLE", "", 20, 0, 0),
+            (7, "Lagerstand Übersicht", "WAREHOUSE", "ALLE", "", 20, 0, 0),
+            (8, "Wareneingang 1",       "DETAIL",    "ALLE", "", 15, 0, 0),
+            (9, "Wareneingang 2",       "DETAIL",    "ALLE", "", 15, 0, 0),
         ]
         cur.executemany(
             """
@@ -265,8 +313,8 @@ def init_db(conn: sqlite3.Connection):
     else:
         for sid, name, mode, refresh in [
             (7, "Lagerstand Übersicht", "WAREHOUSE", 20),
-            (8, "Wareneingang 1",       "DETAIL",    15),
-            (9, "Wareneingang 2",       "DETAIL",    15),
+            (8, "Wareneingang 1",       "DETAIL", 15),
+            (9, "Wareneingang 2",       "DETAIL", 15),
         ]:
             cur.execute("SELECT COUNT(*) FROM screens WHERE id=?", (sid,))
             if cur.fetchone()[0] == 0:
@@ -286,8 +334,11 @@ def init_db(conn: sqlite3.Connection):
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_departures_source_key ON departures(source_key)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_departures_screen_id ON departures(screen_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_departures_datetime ON departures(datetime)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_tour_stops_tour_id ON tour_stops(tour_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_departures_location_id ON departures(location_id)")
 
     conn.commit()
+
 
 def migrate_db(conn: sqlite3.Connection):
     cur = conn.cursor()
@@ -337,59 +388,53 @@ def migrate_db(conn: sqlite3.Connection):
     except Exception:
         pass
 
-    try:
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_departures_source_key ON departures(source_key);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_departures_screen_id ON departures(screen_id);")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_departures_datetime ON departures(datetime);")
-    except Exception:
-        pass
-
     conn.commit()
 
-@st.cache_resource
-def get_connection():
+
+def _open_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
 
+
+@contextmanager
+def get_connection():
+    conn = None
     try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        conn.execute("PRAGMA busy_timeout=30000;")
-    except Exception:
-        pass
-
-    if not integrity_ok(conn):
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-        bad_name = DB_PATH.with_suffix(f".corrupt_{int(now_berlin().timestamp())}.db")
-        try:
-            if DB_PATH.exists():
-                DB_PATH.rename(bad_name)
-        except Exception:
+        conn = _open_connection()
+        if not integrity_ok(conn):
             try:
-                DB_PATH.unlink(missing_ok=True)
+                conn.close()
             except Exception:
                 pass
 
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            conn.execute("PRAGMA foreign_keys=ON;")
-            conn.execute("PRAGMA busy_timeout=30000;")
-        except Exception:
-            pass
+            bad_name = DB_PATH.with_suffix(f".corrupt_{int(now_berlin().timestamp())}.db")
+            try:
+                if DB_PATH.exists():
+                    DB_PATH.rename(bad_name)
+            except Exception:
+                try:
+                    DB_PATH.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-    init_db(conn)
-    migrate_db(conn)
-    return conn
+            conn = _open_connection()
+
+        init_db(conn)
+        migrate_db(conn)
+        yield conn
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
 
 # ==================================================
 # DB Helper
@@ -398,17 +443,21 @@ def get_connection():
 def read_df(conn: sqlite3.Connection, query: str, params=()):
     return pd.read_sql_query(query, conn, params=params)
 
+
 def load_locations(conn):
     return read_df(conn, "SELECT id, name, type, active, color, text_color FROM locations ORDER BY id")
 
+
 def load_screens(conn):
     return read_df(conn, "SELECT * FROM screens ORDER BY id")
+
 
 def _ensure_columns(df: pd.DataFrame, required: dict) -> pd.DataFrame:
     for col, default in required.items():
         if col not in df.columns:
             df[col] = default
     return df
+
 
 def load_departures_with_locations(conn):
     try:
@@ -434,7 +483,7 @@ def load_departures_with_locations(conn):
                    l.text_color           AS location_text_color
             FROM departures d
             JOIN locations l ON d.location_id = l.id
-            """,
+            """
         )
     except Exception:
         df = pd.DataFrame()
@@ -472,6 +521,7 @@ def load_departures_with_locations(conn):
 
     return df
 
+
 def load_tours(conn):
     return read_df(
         conn,
@@ -490,8 +540,9 @@ def load_tours(conn):
         FROM tours t
         JOIN locations l ON t.location_id = l.id
         ORDER BY t.id
-        """,
+        """
     )
+
 
 def load_tour_stops(conn, tour_id: int):
     return read_df(
@@ -506,9 +557,11 @@ def load_tour_stops(conn, tour_id: int):
         (tour_id,),
     )
 
+
 def load_ticker_for_screen(conn, screen_id: int):
     df = read_df(conn, "SELECT screen_id, text, active FROM tickers WHERE screen_id=?", (int(screen_id),))
     return df.iloc[0] if not df.empty else None
+
 
 # ==================================================
 # Parsing Screen IDs
@@ -526,6 +579,7 @@ def parse_screen_ids(screen_ids_value):
         if p.isdigit():
             out.append(int(p))
     return out
+
 
 # ==================================================
 # Status Automation
@@ -579,6 +633,24 @@ def update_departure_statuses(conn: sqlite3.Connection):
     if to_ready or to_done:
         conn.commit()
 
+
+# ==================================================
+# Tour-Abfahrten löschen / neu materialisieren
+# ==================================================
+
+def delete_future_materialized_departures_for_tour(conn: sqlite3.Connection, tour_id: int):
+    now_iso = now_berlin().isoformat(timespec="seconds")
+    conn.execute(
+        """
+        DELETE FROM departures
+        WHERE source_key LIKE ?
+          AND datetime >= ?
+        """,
+        (f"TOUR:{int(tour_id)}:%", now_iso),
+    )
+    conn.commit()
+
+
 # ==================================================
 # Materialize Tours -> Departures (12h vorher)
 # ==================================================
@@ -615,25 +687,24 @@ def materialize_tours_to_departures(conn: sqlite3.Connection, create_window_hour
     cur = conn.cursor()
 
     for _, r in df.iterrows():
-        tour_id = int(r["tour_id"])
-        pos = int(r["position"])
-        loc_id = int(r["location_id"])
+        tour_id = to_int(r["tour_id"])
+        pos = to_int(r["position"])
+        loc_id = to_int(r["location_id"])
         weekday = str(r["weekday"])
 
-        hour = int(r["hour"]) if str(r["hour"]).isdigit() else 0
-        minute = int(r["minute"]) if str(r["minute"]).isdigit() else 0
+        hour = to_int(r["hour"], 0)
+        minute = to_int(r["minute"], 0)
         minute = 0 if minute not in (0, 30) else minute
 
         note = (r["tour_note"] or "").strip()
         screen_ids = parse_screen_ids(r["tour_screen_ids"])
-        tour_cd = int(pd.to_numeric(r.get("tour_countdown_enabled", 0), errors="coerce") or 0)
+        tour_cd = to_int(r.get("tour_countdown_enabled", 0), 0)
 
         if not screen_ids or weekday not in WEEKDAYS_DE:
             continue
 
         dep_dt = next_datetime_for_weekday_time(weekday, hour, minute)
 
-        # nur innerhalb Window materialisieren
         if dep_dt - now > window:
             continue
         if now - dep_dt > timedelta(days=1):
@@ -656,6 +727,7 @@ def materialize_tours_to_departures(conn: sqlite3.Connection, create_window_hour
 
     if created_any:
         conn.commit()
+
 
 # ==================================================
 # Manuelle Abfahrten anlegen
@@ -684,8 +756,9 @@ def create_manual_departures(conn: sqlite3.Connection, dep_dt: datetime, locatio
     if created_any:
         conn.commit()
 
+
 # ==================================================
-# Screen Daten (Tour + Manuell; Anzeige-Fenster 12h)
+# Screen Daten
 # ==================================================
 
 def get_screen_data(conn: sqlite3.Connection, screen_id: int):
@@ -705,11 +778,8 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
         return screen, deps
 
     deps = deps[deps["location_active"] == 1].copy()
-
-    # nur Abfahrten, die diesem Screen gehören (oder global)
     deps = deps[(deps["screen_id"].isna()) | (deps["screen_id"] == int(screen_id))]
 
-    # Filter Typ / Locations
     if filter_type != "ALLE":
         deps = deps[deps["location_type"] == filter_type]
 
@@ -718,8 +788,6 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
         if ids:
             deps = deps[deps["location_id"].isin(ids)]
 
-    # Sichtbarkeit:
-    # - Zeige Einträge im Fenster: [now-20min .. now+12h]
     window_start = now - timedelta(minutes=AUTO_COMPLETE_AFTER_MIN)
     deps = deps[(deps["datetime"] >= window_start) & (deps["datetime"] <= end)]
 
@@ -736,7 +804,6 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
 
     deps = deps[deps.apply(visible, axis=1)]
 
-    # Countdown-Info (nur wenn countdown_enabled=1)
     def build_line_info(row):
         cd_on = int(row.get("countdown_enabled", 1) or 1) == 1
         if not cd_on:
@@ -762,11 +829,10 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
         return ""
 
     deps["line_info"] = deps.apply(build_line_info, axis=1)
-
-    # Sortiert nach Zeit (alles im Fenster)
     deps = deps.sort_values("datetime")
 
     return screen, deps
+
 
 # ==================================================
 # HTML Helpers
@@ -774,6 +840,7 @@ def get_screen_data(conn: sqlite3.Connection, screen_id: int):
 
 def escape_html(text: str) -> str:
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 def render_big_table(headers, rows, row_colors=None, text_colors=None):
     thead = "".join(f"<th>{h}</th>" for h in headers)
@@ -804,8 +871,9 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None):
         unsafe_allow_html=True,
     )
 
+
 # ==================================================
-# Screen 7 Übersicht: Nächste + Übernächste pro Zone (1–4,8,9)
+# Screen 7 Übersicht
 # ==================================================
 
 def get_next_two_departures_for_zone(conn: sqlite3.Connection, zone_screen_id: int):
@@ -827,6 +895,7 @@ def get_next_two_departures_for_zone(conn: sqlite3.Connection, zone_screen_id: i
             "note": str(r.get("note") or ""),
         })
     return out
+
 
 # ==================================================
 # Display Mode
@@ -873,132 +942,129 @@ def show_display_mode(screen_id: int):
         st.error("Parameter 'screenId' fehlt oder ist ungültig.")
         return
 
-    conn = get_connection()
+    with get_connection() as conn:
+        materialize_tours_to_departures(conn, create_window_hours=MATERIALIZE_TOURS_HOURS_BEFORE)
+        update_departure_statuses(conn)
 
-    materialize_tours_to_departures(conn, create_window_hours=MATERIALIZE_TOURS_HOURS_BEFORE)
-    update_departure_statuses(conn)
+        screens = load_screens(conn)
+        if screens.empty or int(screen_id) not in screens["id"].tolist():
+            st.error(f"Screen {screen_id} ist nicht konfiguriert.")
+            return
 
-    screens = load_screens(conn)
-    if screens.empty or int(screen_id) not in screens["id"].tolist():
-        st.error(f"Screen {screen_id} ist nicht konfiguriert.")
-        return
+        screen = screens.loc[screens["id"] == int(screen_id)].iloc[0]
+        interval_sec = int(screen.get("refresh_interval_seconds", 30))
+        st_autorefresh(interval=interval_sec * 1000, key=f"display_refresh_{screen_id}")
 
-    screen = screens.loc[screens["id"] == int(screen_id)].iloc[0]
-    interval_sec = int(screen.get("refresh_interval_seconds", 30))
-    st_autorefresh(interval=interval_sec * 1000, key=f"display_refresh_{screen_id}")
+        holiday_active = bool(screen.get("holiday_flag", 0))
+        special_active = bool(screen.get("special_flag", 0))
 
-    holiday_active = bool(screen.get("holiday_flag", 0))
-    special_active = bool(screen.get("special_flag", 0))
+        if holiday_active or special_active:
+            labels = []
+            if holiday_active:
+                labels.append("Feiertagsbelieferung")
+            if special_active:
+                labels.append("Sonderplan")
+            msg = " - ".join(l.upper() for l in labels)
+            st.markdown(
+                f"""
+                <div style="display:flex;justify-content:center;align-items:center;height:100vh;width:100%;
+                            background:#000;color:#fff;font-size:72px;font-weight:900;text-transform:uppercase;text-align:center;">
+                  {msg}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            return
 
-    if holiday_active or special_active:
-        st.markdown("<style>body, .block-container { background-color:#000 !important; color:#fff !important; }</style>", unsafe_allow_html=True)
-        labels = []
-        if holiday_active:
-            labels.append("Feiertagsbelieferung")
-        if special_active:
-            labels.append("Sonderplan")
-        msg = " - ".join(l.upper() for l in labels)
-        st.markdown(
-            f"""
-            <div style="display:flex;justify-content:center;align-items:center;height:100vh;width:100%;
-                        background:#000;color:#fff;font-size:72px;font-weight:900;text-transform:uppercase;text-align:center;">
-              {msg}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        return
+        if int(screen["id"]) == 7 or str(screen.get("mode", "")).upper() == "WAREHOUSE":
+            st.markdown(f"## {screen['name']} (Screen {int(screen['id'])})")
+            st.caption(
+                f"Aktualisierung alle {interval_sec} Sekunden • DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h"
+            )
 
-    # Screen 7: Lagerstand Übersicht (Zone A-D + WE1/WE2)
-    if int(screen["id"]) == 7 or str(screen.get("mode", "")).upper() == "WAREHOUSE":
-        st.markdown(f"## {screen['name']} (Screen {int(screen['id'])})")
+            rows = []
+            for zid in [1, 2, 3, 4, 8, 9]:
+                zone_name = ZONE_NAME_MAP.get(zid, f"Screen {zid}")
+                nxt = get_next_two_departures_for_zone(conn, zid)
+                if not nxt:
+                    rows.append([zone_name, "—", "—"])
+                    continue
+
+                def fmt_item(item):
+                    return f"{item['dt'].strftime('%a, %d.%m %H:%M')} – {escape_html(item['location'])}"
+
+                first = fmt_item(nxt[0]) if len(nxt) >= 1 else "—"
+                second = fmt_item(nxt[1]) if len(nxt) >= 2 else "—"
+                rows.append([zone_name, first, second])
+
+            render_big_table(["Zone", "Nächste Abfahrt", "Übernächste Abfahrt"], rows)
+
+            ticker = load_ticker_for_screen(conn, int(screen_id))
+            if ticker is not None and int(ticker["active"]) == 1 and (ticker["text"] or "").strip():
+                st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(ticker['text'])}</div></div>", unsafe_allow_html=True)
+            return
+
+        st.markdown(f"## {screen['name']} (Screen {screen_id})")
         st.caption(
-            f"Aktualisierung alle {interval_sec} Sekunden • DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h"
+            f"Modus: {screen['mode']} • DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h"
         )
 
-        rows = []
-        for zid in [1, 2, 3, 4, 8, 9]:
-            zone_name = ZONE_NAME_MAP.get(zid, f"Screen {zid}")
-            nxt = get_next_two_departures_for_zone(conn, zid)
-            if not nxt:
-                rows.append([zone_name, "—", "—"])
-                continue
+        screen_obj, data = get_screen_data(conn, int(screen_id))
 
-            def fmt_item(item):
-                return f"{item['dt'].strftime('%a, %d.%m %H:%M')} – {escape_html(item['location'])}"
+        if data is None or data.empty:
+            st.info("Keine Abfahrten im nächsten Zeitfenster.")
+        else:
+            if str(screen_obj["mode"]).upper() == "DETAIL" and int(screen_obj["id"]) in ZONE_SCREEN_IDS:
+                subset = data[["datetime", "location_name", "note", "line_info", "location_color", "location_text_color"]].copy()
+                subset["note"] = subset["note"].fillna("")
+                subset["line_info"] = subset["line_info"].fillna("")
+                subset["time"] = subset["datetime"].apply(lambda d: ensure_tz(d).strftime("%H:%M") if pd.notnull(d) else "")
 
-            first = fmt_item(nxt[0]) if len(nxt) >= 1 else "—"
-            second = fmt_item(nxt[1]) if len(nxt) >= 2 else "—"
-            rows.append([zone_name, first, second])
+                def combine(r):
+                    parts = [f"<b>{escape_html(r['time'])}</b>"]
+                    if r["note"]:
+                        parts.append(escape_html(r["note"]))
+                    if r["line_info"]:
+                        parts.append(escape_html(r["line_info"]))
+                    return "<br/>".join([p for p in parts if p])
 
-        render_big_table(["Zone", "Nächste Abfahrt", "Übernächste Abfahrt"], rows)
+                subset["combined"] = subset.apply(combine, axis=1)
+
+                rows = subset[["location_name", "combined"]].itertuples(index=False, name=None)
+                render_big_table(
+                    ["Einrichtung", "Hinweis / Countdown"],
+                    rows,
+                    row_colors=subset["location_color"].fillna("").tolist(),
+                    text_colors=subset["location_text_color"].fillna("").tolist(),
+                )
+            else:
+                subset = data.copy()
+                for _, row in subset.iterrows():
+                    note = (row.get("note") or "")
+                    li = (row.get("line_info") or "")
+                    dt = row.get("datetime")
+                    tstr = ensure_tz(dt).strftime("%H:%M") if pd.notnull(dt) else ""
+                    extra = ""
+                    if note or li:
+                        extra = "<br/><span style='font-size:28px;'>" + escape_html(note)
+                        if note and li:
+                            extra += " · "
+                        extra += escape_html(li) + "</span>"
+
+                    main = f"<b>{escape_html(tstr)} – {escape_html(row['location_name'])}</b>"
+                    bg = row.get("location_color") or ""
+                    tc = row.get("location_text_color") or ""
+                    style = "margin-bottom:10px;"
+                    if bg:
+                        style += f"background-color:{bg};padding:0.3em 0.5em;border-radius:0.2em;"
+                    if tc:
+                        style += f"color:{tc};"
+                    st.markdown(f"<div style='{style}'>{main}{extra}</div>", unsafe_allow_html=True)
 
         ticker = load_ticker_for_screen(conn, int(screen_id))
         if ticker is not None and int(ticker["active"]) == 1 and (ticker["text"] or "").strip():
             st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(ticker['text'])}</div></div>", unsafe_allow_html=True)
-        return
 
-    # DETAIL/OVERVIEW Screens
-    st.markdown(f"## {screen['name']} (Screen {screen_id})")
-    st.caption(
-        f"Modus: {screen['mode']} • DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h"
-    )
-
-    screen_obj, data = get_screen_data(conn, int(screen_id))
-
-    if data is None or data.empty:
-        st.info("Keine Abfahrten im nächsten Zeitfenster.")
-    else:
-        if str(screen_obj["mode"]).upper() == "DETAIL" and int(screen_obj["id"]) in ZONE_SCREEN_IDS:
-            subset = data[["datetime", "location_name", "note", "line_info", "location_color", "location_text_color"]].copy()
-            subset["note"] = subset["note"].fillna("")
-            subset["line_info"] = subset["line_info"].fillna("")
-            subset["time"] = subset["datetime"].apply(lambda d: ensure_tz(d).strftime("%H:%M") if pd.notnull(d) else "")
-
-            def combine(r):
-                parts = [f"<b>{escape_html(r['time'])}</b>"]
-                if r["note"]:
-                    parts.append(escape_html(r["note"]))
-                if r["line_info"]:
-                    parts.append(escape_html(r["line_info"]))
-                return "<br/>".join([p for p in parts if p])
-
-            subset["combined"] = subset.apply(combine, axis=1)
-
-            rows = subset[["location_name", "combined"]].itertuples(index=False, name=None)
-            render_big_table(
-                ["Einrichtung", "Hinweis / Countdown"],
-                rows,
-                row_colors=subset["location_color"].fillna("").tolist(),
-                text_colors=subset["location_text_color"].fillna("").tolist(),
-            )
-        else:
-            subset = data.copy()
-            for _, row in subset.iterrows():
-                note = (row.get("note") or "")
-                li = (row.get("line_info") or "")
-                dt = row.get("datetime")
-                tstr = ensure_tz(dt).strftime("%H:%M") if pd.notnull(dt) else ""
-                extra = ""
-                if note or li:
-                    extra = "<br/><span style='font-size:28px;'>" + escape_html(note)
-                    if note and li:
-                        extra += " · "
-                    extra += escape_html(li) + "</span>"
-
-                main = f"<b>{escape_html(tstr)} – {escape_html(row['location_name'])}</b>"
-                bg = row.get("location_color") or ""
-                tc = row.get("location_text_color") or ""
-                style = "margin-bottom:10px;"
-                if bg:
-                    style += f"background-color:{bg};padding:0.3em 0.5em;border-radius:0.2em;"
-                if tc:
-                    style += f"color:{tc};"
-                st.markdown(f"<div style='{style}'>{main}{extra}</div>", unsafe_allow_html=True)
-
-    ticker = load_ticker_for_screen(conn, int(screen_id))
-    if ticker is not None and int(ticker["active"]) == 1 and (ticker["text"] or "").strip():
-        st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(ticker['text'])}</div></div>", unsafe_allow_html=True)
 
 # ==================================================
 # Export/Import/Backup
@@ -1009,10 +1075,12 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     df.to_csv(out, index=False, sep=";", encoding="utf-8")
     return ("\ufeff" + out.getvalue()).encode("utf-8")
 
+
 def export_locations_json(conn) -> bytes:
     df = load_locations(conn)
     payload = {"version": 1, "exported_at": now_berlin().isoformat(), "locations": df.to_dict(orient="records")}
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
 
 def import_locations_json(conn, data: dict) -> tuple[int, int]:
     locations = data.get("locations", [])
@@ -1056,6 +1124,7 @@ def import_locations_json(conn, data: dict) -> tuple[int, int]:
     conn.commit()
     return inserted, updated
 
+
 def export_tours_json(conn) -> bytes:
     tours = load_tours(conn)
     items = []
@@ -1089,6 +1158,7 @@ def export_tours_json(conn) -> bytes:
     payload = {"version": 1, "exported_at": now_berlin().isoformat(), "tours": items}
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
+
 def _resolve_location_id(conn, location_id, location_name):
     cur = conn.cursor()
     if location_id is not None:
@@ -1106,6 +1176,7 @@ def _resolve_location_id(conn, location_id, location_name):
         return int(r[0])
     return None
 
+
 def import_tours_json(conn, data: dict) -> tuple[int, int]:
     tours = data.get("tours", [])
     inserted = 0
@@ -1117,8 +1188,8 @@ def import_tours_json(conn, data: dict) -> tuple[int, int]:
         name = (t.get("name") or "").strip()
         weekday = (t.get("weekday") or "").strip()
 
-        hour = int(t.get("hour", 0))
-        minute = int(t.get("minute", 0) or 0)
+        hour = to_int(t.get("hour", 0), 0)
+        minute = to_int(t.get("minute", 0), 0)
         minute = 0 if minute not in (0, 30) else minute
 
         note = (t.get("note") or "").strip()
@@ -1186,7 +1257,6 @@ def import_tours_json(conn, data: dict) -> tuple[int, int]:
             new_id = cur.lastrowid
             inserted += 1
 
-            cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(new_id),))
             for pos, loc_id in enumerate(resolved_stop_ids):
                 cur.execute(
                     "INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)",
@@ -1195,6 +1265,7 @@ def import_tours_json(conn, data: dict) -> tuple[int, int]:
 
     conn.commit()
     return inserted, updated
+
 
 def export_backup_json(conn) -> bytes:
     payload = {
@@ -1205,13 +1276,16 @@ def export_backup_json(conn) -> bytes:
     }
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
+
 def import_backup_json(conn, data: dict) -> tuple[tuple[int, int], tuple[int, int]]:
     loc_ins, loc_upd = import_locations_json(conn, {"locations": data.get("locations", [])})
     tour_ins, tour_upd = import_tours_json(conn, {"tours": data.get("tours", [])})
     return (loc_ins, loc_upd), (tour_ins, tour_upd)
 
+
 def export_locations_csv(conn) -> bytes:
     return df_to_csv_bytes(load_locations(conn))
+
 
 def export_tours_csv(conn) -> tuple[bytes, bytes]:
     tours = load_tours(conn)
@@ -1242,6 +1316,7 @@ def export_tours_csv(conn) -> tuple[bytes, bytes]:
             })
     stops_df = pd.DataFrame(stops_rows, columns=["tour_id", "position", "location_id", "location_name"])
     return df_to_csv_bytes(touren_out), df_to_csv_bytes(stops_df)
+
 
 # ==================================================
 # Admin: Einrichtungen
@@ -1296,6 +1371,7 @@ def show_admin_locations(conn, can_edit: bool):
         submitted = st.form_submit_button("Speichern")
 
     if submitted:
+        require_admin()
         if not name.strip():
             st.error("Name darf nicht leer sein.")
         else:
@@ -1336,6 +1412,7 @@ def show_admin_locations(conn, can_edit: bool):
         delete = b2.form_submit_button("Einrichtung löschen")
 
     if save:
+        require_admin()
         if not name_edit.strip():
             st.error("Name darf nicht leer sein.")
         else:
@@ -1348,6 +1425,7 @@ def show_admin_locations(conn, can_edit: bool):
             st.rerun()
 
     if delete:
+        require_admin()
         dep_count = read_df(conn, "SELECT COUNT(*) AS c FROM departures WHERE location_id=?", (int(selected),)).iloc[0]["c"]
         tour_count = read_df(conn, "SELECT COUNT(*) AS c FROM tours WHERE location_id=?", (int(selected),)).iloc[0]["c"]
         stop_count = read_df(conn, "SELECT COUNT(*) AS c FROM tour_stops WHERE location_id=?", (int(selected),)).iloc[0]["c"]
@@ -1359,8 +1437,9 @@ def show_admin_locations(conn, can_edit: bool):
             st.success("Einrichtung gelöscht.")
             st.rerun()
 
+
 # ==================================================
-# Admin: Abfahrten (Tour + Manuell; inkl. manuelles Anlegen)
+# Admin: Abfahrten
 # ==================================================
 
 def show_admin_departures(conn, can_edit: bool):
@@ -1371,12 +1450,13 @@ def show_admin_departures(conn, can_edit: bool):
 
     deps = load_departures_with_locations(conn).sort_values("datetime")
 
-    # Anzeige etwas kompakter
     if deps.empty:
         st.info("Noch keine Abfahrten vorhanden.")
     else:
         deps_view = deps.copy()
-        deps_view["Quelle"] = deps_view["source_key"].astype(str).apply(lambda s: "TOUR" if s.startswith("TOUR:") else ("MANUELL" if s.startswith("MANUAL:") else "SONST"))
+        deps_view["Quelle"] = deps_view["source_key"].astype(str).apply(
+            lambda s: "TOUR" if s.startswith("TOUR:") else ("MANUELL" if s.startswith("MANUAL:") else "SONST")
+        )
         deps_view["Zeit"] = deps_view["datetime"].apply(lambda d: ensure_tz(d).strftime("%d.%m.%Y %H:%M") if pd.notnull(d) else "")
         st.dataframe(
             deps_view[["Zeit", "screen_id", "location_name", "note", "status", "countdown_enabled", "Quelle", "source_key"]].copy(),
@@ -1410,7 +1490,7 @@ def show_admin_departures(conn, can_edit: bool):
             note = st.text_input("Hinweis (optional)", "")
         with c2:
             dep_date = st.date_input("Datum", value=now_berlin().date())
-            time_label = st.selectbox("Uhrzeit (00/30)", time_options_half_hour(), index=time_options_half_hour().index("08:00") if "08:00" in time_options_half_hour() else 0)
+            time_label = st.selectbox("Uhrzeit (00/30)", time_options_half_hour(), index=time_options_half_hour().index("08:00"))
             hh, mm = map(int, time_label.split(":"))
         with c3:
             screens_sel = st.multiselect(
@@ -1424,6 +1504,7 @@ def show_admin_departures(conn, can_edit: bool):
         submitted = st.form_submit_button("Manuelle Abfahrt speichern")
 
     if submitted:
+        require_admin()
         if not screens_sel:
             st.error("Bitte mindestens einen Screen auswählen.")
         else:
@@ -1442,7 +1523,6 @@ def show_admin_departures(conn, can_edit: bool):
 
     st.markdown("---")
     st.markdown("### Löschen (nur Admin)")
-    # Nur manuelle Abfahrten löschbar (sicherer), Tour-Abfahrten regenerieren sich automatisch
     manual = deps[deps["source_key"].astype(str).str.startswith("MANUAL:")] if not deps.empty else pd.DataFrame()
     if manual.empty:
         st.info("Keine manuellen Abfahrten vorhanden.")
@@ -1451,10 +1531,12 @@ def show_admin_departures(conn, can_edit: bool):
     ids = manual["id"].tolist()
     del_id = st.selectbox("Manuelle Abfahrt auswählen", ids, format_func=lambda i: f"ID {i}", key="del_dep_pick")
     if st.button("Ausgewählte manuelle Abfahrt löschen"):
+        require_admin()
         conn.execute("DELETE FROM departures WHERE id=?", (int(del_id),))
         conn.commit()
         st.success("Manuelle Abfahrt gelöscht.")
         st.rerun()
+
 
 # ==================================================
 # Admin: Touren
@@ -1479,7 +1561,7 @@ def show_admin_tours(conn, can_edit: bool):
         st.info("Noch keine Touren vorhanden.")
     else:
         view = tours.copy()
-        view["Zeit"] = view.apply(lambda r: f"{int(r['hour']):02d}:{int(r.get('minute',0) or 0):02d}", axis=1)
+        view["Zeit"] = view.apply(lambda r: f"{int(r['hour']):02d}:{int(r.get('minute', 0) or 0):02d}", axis=1)
         view["Monitore"] = view["screen_ids"].apply(
             lambda s: ", ".join([f"{i}:{screen_map.get(i, f'Screen {i}')}" for i in parse_screen_ids(s)])
         )
@@ -1524,7 +1606,7 @@ def show_admin_tours(conn, can_edit: bool):
             tour_name = st.text_input("Tour-Name", "")
             weekday = st.selectbox("Wochentag", WEEKDAYS_DE)
         with col2:
-            time_label = st.selectbox("Uhrzeit (00/30)", time_opts, index=time_opts.index("08:00") if "08:00" in time_opts else 0)
+            time_label = st.selectbox("Uhrzeit (00/30)", time_opts, index=time_opts.index("08:00"))
             hour_int, minute_int = map(int, time_label.split(":"))
         with col3:
             screens_new = st.multiselect(
@@ -1546,6 +1628,7 @@ def show_admin_tours(conn, can_edit: bool):
         submitted = st.form_submit_button("Tour speichern")
 
     if submitted:
+        require_admin()
         if not tour_name.strip():
             st.error("Tour-Name darf nicht leer sein.")
         elif not screens_new:
@@ -1588,7 +1671,7 @@ def show_admin_tours(conn, can_edit: bool):
     existing_stop_ids = stops_df["location_id"].tolist() if not stops_df.empty else [int(row["location_id"])]
 
     existing_screen_ids = parse_screen_ids(row["screen_ids"])
-    cur_time = f"{int(row['hour']):02d}:{int(row.get('minute',0) or 0):02d}"
+    cur_time = f"{int(row['hour']):02d}:{int(row.get('minute', 0) or 0):02d}"
     if cur_time not in time_opts:
         cur_time = "08:00"
 
@@ -1628,6 +1711,7 @@ def show_admin_tours(conn, can_edit: bool):
         delete = b2.form_submit_button("Tour löschen")
 
     if save:
+        require_admin()
         if not name_edit.strip():
             st.error("Tour-Name darf nicht leer sein.")
         elif not screens_edit:
@@ -1651,20 +1735,27 @@ def show_admin_tours(conn, can_edit: bool):
             cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(selected),))
             for pos, loc_id in enumerate(stops_edit):
                 cur.execute("INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)", (int(selected), int(loc_id), int(pos)))
+
+            delete_future_materialized_departures_for_tour(conn, int(selected))
+            materialize_tours_to_departures(conn, create_window_hours=MATERIALIZE_TOURS_HOURS_BEFORE)
+
             conn.commit()
             st.success("Tour aktualisiert.")
             st.rerun()
 
     if delete:
+        require_admin()
         cur = conn.cursor()
+        delete_future_materialized_departures_for_tour(conn, int(selected))
         cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(selected),))
         cur.execute("DELETE FROM tours WHERE id=?", (int(selected),))
         conn.commit()
         st.success("Tour gelöscht.")
         st.rerun()
 
+
 # ==================================================
-# Admin: Screens + Links + Sonderplan/Feiertag + Ticker
+# Admin: Screens / Ticker
 # ==================================================
 
 def show_admin_screens(conn, can_edit: bool):
@@ -1711,6 +1802,7 @@ def show_admin_screens(conn, can_edit: bool):
         submitted = st.form_submit_button("Speichern")
 
     if submitted:
+        require_admin()
         conn.execute(
             """
             UPDATE screens
@@ -1736,6 +1828,7 @@ def show_admin_screens(conn, can_edit: bool):
         submit = st.form_submit_button("Speichern")
 
     if submit:
+        require_admin()
         conn.execute(
             "INSERT OR REPLACE INTO tickers (screen_id, text, active) VALUES (?, ?, ?)",
             (int(selected), text.strip(), 1 if active else 0),
@@ -1744,8 +1837,9 @@ def show_admin_screens(conn, can_edit: bool):
         st.success("Laufband gespeichert.")
         st.rerun()
 
+
 # ==================================================
-# Admin: Backup + Tabs
+# Admin: Hauptansicht
 # ==================================================
 
 def show_admin_mode():
@@ -1765,86 +1859,89 @@ def show_admin_mode():
         st.session_state["username"] = None
         st.rerun()
 
-    conn = get_connection()
+    with get_connection() as conn:
+        materialize_tours_to_departures(conn, create_window_hours=MATERIALIZE_TOURS_HOURS_BEFORE)
+        update_departure_statuses(conn)
 
-    materialize_tours_to_departures(conn, create_window_hours=MATERIALIZE_TOURS_HOURS_BEFORE)
-    update_departure_statuses(conn)
+        can_edit = role == "admin"
 
-    can_edit = role == "admin"
+        if can_edit:
+            st.markdown("### Backup (Einrichtungen + Touren)")
+            colb1, colb2 = st.columns(2)
 
-    if can_edit:
-        st.markdown("### Backup (Einrichtungen + Touren)")
-        colb1, colb2 = st.columns(2)
-
-        with colb1:
-            st.download_button(
-                "Backup herunterladen (backup_abfahrten.json)",
-                data=export_backup_json(conn),
-                file_name="backup_abfahrten.json",
-                mime="application/json",
-            )
-
-        with colb2:
-            up = st.file_uploader("Backup importieren (backup_abfahrten.json)", type=["json"], key="upl_backup")
-            if up is not None:
-                try:
-                    data = json.loads(up.getvalue().decode("utf-8"))
-                    (li, lu), (ti, tu) = import_backup_json(conn, data)
-                    st.success(f"Backup importiert. Einrichtungen: Neu {li}, Update {lu} • Touren: Neu {ti}, Update {tu}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Backup-Import fehlgeschlagen: {e}")
-
-        st.markdown("---")
-
-        tabs = st.tabs(["Abfahrten (inkl. manuell)", "Einrichtungen", "Touren", "Screens/Ticker"])
-        with tabs[0]:
-            show_admin_departures(conn, can_edit=True)
-        with tabs[1]:
-            show_admin_locations(conn, can_edit=True)
-        with tabs[2]:
-            show_admin_tours(conn, can_edit=True)
-        with tabs[3]:
-            show_admin_screens(conn, can_edit=True)
-
-    else:
-        st.info("Dispo-Ansicht: Touren und Abfahrten sehen, aber nichts löschen/ändern.")
-        tabs = st.tabs(["Abfahrten", "Touren"])
-        with tabs[0]:
-            show_admin_departures(conn, can_edit=False)
-        with tabs[1]:
-            tours = load_tours(conn)
-            if tours.empty:
-                st.info("Noch keine Touren vorhanden.")
-            else:
-                screens = load_screens(conn)
-                screen_map = {int(r["id"]): r["name"] for _, r in screens.iterrows()}
-                view = tours.copy()
-                view["Zeit"] = view.apply(lambda r: f"{int(r['hour']):02d}:{int(r.get('minute',0) or 0):02d}", axis=1)
-                view["Monitore"] = view["screen_ids"].apply(
-                    lambda s: ", ".join([f"{i}:{screen_map.get(i, f'Screen {i}')}" for i in parse_screen_ids(s)])
+            with colb1:
+                st.download_button(
+                    "Backup herunterladen (backup_abfahrten.json)",
+                    data=export_backup_json(conn),
+                    file_name="backup_abfahrten.json",
+                    mime="application/json",
                 )
-                view["Countdown"] = view["countdown_enabled"].apply(lambda v: "Ja" if int(v) == 1 else "Nein")
-                st.dataframe(view[["id", "name", "weekday", "Zeit", "Countdown", "location_name", "note", "active", "Monitore"]],
-                             use_container_width=True)
+
+            with colb2:
+                up = st.file_uploader("Backup importieren (backup_abfahrten.json)", type=["json"], key="upl_backup")
+                if up is not None:
+                    try:
+                        data = json.loads(up.getvalue().decode("utf-8"))
+                        (li, lu), (ti, tu) = import_backup_json(conn, data)
+                        st.success(f"Backup importiert. Einrichtungen: Neu {li}, Update {lu} • Touren: Neu {ti}, Update {tu}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Backup-Import fehlgeschlagen: {e}")
+
+            st.markdown("---")
+
+            tabs = st.tabs(["Abfahrten (inkl. manuell)", "Einrichtungen", "Touren", "Screens/Ticker"])
+            with tabs[0]:
+                show_admin_departures(conn, can_edit=True)
+            with tabs[1]:
+                show_admin_locations(conn, can_edit=True)
+            with tabs[2]:
+                show_admin_tours(conn, can_edit=True)
+            with tabs[3]:
+                show_admin_screens(conn, can_edit=True)
+
+        else:
+            st.info("Dispo-Ansicht: Touren und Abfahrten sehen, aber nichts löschen/ändern.")
+            tabs = st.tabs(["Abfahrten", "Touren"])
+            with tabs[0]:
+                show_admin_departures(conn, can_edit=False)
+            with tabs[1]:
+                tours = load_tours(conn)
+                if tours.empty:
+                    st.info("Noch keine Touren vorhanden.")
+                else:
+                    screens = load_screens(conn)
+                    screen_map = {int(r["id"]): r["name"] for _, r in screens.iterrows()}
+                    view = tours.copy()
+                    view["Zeit"] = view.apply(lambda r: f"{int(r['hour']):02d}:{int(r.get('minute', 0) or 0):02d}", axis=1)
+                    view["Monitore"] = view["screen_ids"].apply(
+                        lambda s: ", ".join([f"{i}:{screen_map.get(i, f'Screen {i}')}" for i in parse_screen_ids(s)])
+                    )
+                    view["Countdown"] = view["countdown_enabled"].apply(lambda v: "Ja" if int(v) == 1 else "Nein")
+                    st.dataframe(
+                        view[["id", "name", "weekday", "Zeit", "Countdown", "location_name", "note", "active", "Monitore"]],
+                        use_container_width=True
+                    )
+
 
 # ==================================================
 # Main
 # ==================================================
 
 def main():
-    params = st.experimental_get_query_params()
-    mode = params.get("mode", ["admin"])[0]
-    screen_id_param = params.get("screenId", [None])[0]
+    params = st.query_params
+    mode = params.get("mode", "admin")
+    screen_id_param = params.get("screenId", None)
 
     if mode == "display":
         try:
             screen_id = int(screen_id_param) if screen_id_param is not None else None
-        except ValueError:
+        except (ValueError, TypeError):
             screen_id = None
         show_display_mode(screen_id)
     else:
         show_admin_mode()
+
 
 if __name__ == "__main__":
     main()
