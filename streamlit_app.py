@@ -5,10 +5,11 @@ import json
 import io
 import time
 import uuid
-from datetime import datetime, timedelta, time as dtime
+import os
+import shutil
+from datetime import datetime, timedelta, time as dtime, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from contextlib import contextmanager
 
 from streamlit_autorefresh import st_autorefresh
 
@@ -18,18 +19,36 @@ from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Abfahrten", layout="wide")
 
-DB_PATH = Path("abfahrten.db")
+APP_NAME = "Abfahrten"
 TZ = ZoneInfo("Europe/Berlin")
 
-# Optional über .streamlit/secrets.toml überschreibbar:
-# [users.admin]
-# password = "deinpasswort"
-# role = "admin"
-#
-# [users.dispo]
-# password = "deinpasswort"
-# role = "viewer"
-DEFAULT_USERS = {
+def get_persistent_app_dir() -> Path:
+    local_appdata = os.getenv("LOCALAPPDATA")
+    if local_appdata:
+        app_dir = Path(local_appdata) / APP_NAME
+    else:
+        app_dir = Path.home() / f".{APP_NAME.lower()}"
+
+    app_dir.mkdir(parents=True, exist_ok=True)
+    return app_dir
+
+def get_persistent_db_path() -> Path:
+    app_dir = get_persistent_app_dir()
+    target_db = app_dir / "abfahrten.db"
+
+    # Alte DB aus dem bisherigen Startordner beim ersten Start übernehmen
+    old_db = Path("abfahrten.db")
+    if not target_db.exists() and old_db.exists():
+        shutil.copy2(old_db, target_db)
+
+    return target_db
+
+DB_PATH = get_persistent_db_path()
+BACKUP_DIR = DB_PATH.parent / "backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Login (einfach, lokal in Code)
+USERS = {
     "admin": {"password": "admin123", "role": "admin"},
     "dispo": {"password": "dispo123", "role": "viewer"},
 }
@@ -37,14 +56,19 @@ DEFAULT_USERS = {
 WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
 WEEKDAY_TO_INT = {name: i for i, name in enumerate(WEEKDAYS_DE)}  # Montag=0
 
+# Countdown beginnt 3 Stunden vorher (wenn in der Tour aktiviert)
 COUNTDOWN_START_HOURS = 3
+
+# Status-Automatik (gilt für Touren- und manuelle Abfahrten)
 AUTO_COMPLETE_AFTER_MIN = 20
 KEEP_COMPLETED_MINUTES = 10
 
+# Touren werden automatisch zu echten Abfahrten materialisiert
+# UND: Touren sollen 12 Stunden vor Abfahrt auf Screens erscheinen
 MATERIALIZE_TOURS_HOURS_BEFORE = 12
-DISPLAY_WINDOW_HOURS = 12
+DISPLAY_WINDOW_HOURS = 12  # Anzeige-Fenster für Screens: jetzt .. +12h
 
-ZONE_SCREEN_IDS = [1, 2, 3, 4, 8, 9]
+ZONE_SCREEN_IDS = [1, 2, 3, 4, 8, 9]  # Zone A-D + Wareneingang 1/2
 ZONE_NAME_MAP = {
     1: "Zone A",
     2: "Zone B",
@@ -53,7 +77,6 @@ ZONE_NAME_MAP = {
     8: "Wareneingang 1",
     9: "Wareneingang 2",
 }
-
 
 # ==================================================
 # Benutzer / Auth
