@@ -49,6 +49,12 @@ ZONE_NAME_MAP = {
     9: "Wareneingang 2",
 }
 
+COMBINED_SCREEN_MAP = {
+    101: {"name": "Split A + B", "left": 1, "right": 2},
+    102: {"name": "Split C + D", "left": 3, "right": 4},
+    103: {"name": "Split Wareneingang 1 + 2", "left": 8, "right": 9},
+}
+
 
 def get_base_dir() -> Path:
     if USE_PORTABLE_MODE:
@@ -768,6 +774,46 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None):
     )
 
 
+def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: str):
+    left_screen, left_data = get_screen_data(conn, left_screen_id)
+    right_screen, right_data = get_screen_data(conn, right_screen_id)
+
+    st.markdown(f"## {title}")
+    st.caption(f"DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        left_name = left_screen["name"] if left_screen is not None else f"Screen {left_screen_id}"
+        st.markdown(f"### {left_name}")
+        if left_data is None or left_data.empty:
+            st.info("Keine Abfahrten im Zeitfenster.")
+        else:
+            rows = []
+            for _, r in left_data.iterrows():
+                info = str(r.get("note") or "")
+                li = str(r.get("line_info") or "")
+                if li:
+                    info = (info + " · " if info else "") + li
+                rows.append([ensure_tz(r["datetime"]).strftime("%H:%M"), r["location_name"], info])
+            render_big_table(["Zeit", "Einrichtung", "Hinweis / Countdown"], rows)
+
+    with col2:
+        right_name = right_screen["name"] if right_screen is not None else f"Screen {right_screen_id}"
+        st.markdown(f"### {right_name}")
+        if right_data is None or right_data.empty:
+            st.info("Keine Abfahrten im Zeitfenster.")
+        else:
+            rows = []
+            for _, r in right_data.iterrows():
+                info = str(r.get("note") or "")
+                li = str(r.get("line_info") or "")
+                if li:
+                    info = (info + " · " if info else "") + li
+                rows.append([ensure_tz(r["datetime"]).strftime("%H:%M"), r["location_name"], info])
+            render_big_table(["Zeit", "Einrichtung", "Hinweis / Countdown"], rows)
+
+
 # ==================================================
 # Export / Import
 # ==================================================
@@ -1212,8 +1258,25 @@ def show_admin_screens(conn, can_edit: bool):
     st.subheader("Screens / Ticker")
     screens = load_screens(conn)
     st.dataframe(screens, use_container_width=True)
+
+    st.markdown("### Monitore öffnen")
+    button_items = []
     for _, r in screens.iterrows():
-        st.markdown(f"- **Screen {int(r['id'])} – {r['name']}**: `?mode=display&screenId={int(r['id'])}`")
+        sid = int(r["id"])
+        name = str(r["name"])
+        url = f"?mode=display&screenId={sid}"
+        button_items.append((f"Screen {sid} – {name}", url))
+
+    button_items.extend([
+        ("Split A + B", "?mode=display&screenId=101"),
+        ("Split C + D", "?mode=display&screenId=102"),
+        ("Split Wareneingang 1 + 2", "?mode=display&screenId=103"),
+    ])
+
+    cols = st.columns(3)
+    for idx, (label, url) in enumerate(button_items):
+        with cols[idx % 3]:
+            st.link_button(label, url, use_container_width=True)
 
     if not can_edit:
         return
@@ -1325,6 +1388,12 @@ def show_display_mode(screen_id: int):
     materialize_tours_to_departures(conn)
     update_departure_statuses(conn)
     screens = load_screens(conn)
+
+    if int(screen_id) in COMBINED_SCREEN_MAP:
+        cfg = COMBINED_SCREEN_MAP[int(screen_id)]
+        st_autorefresh(interval=15000, key=f"display_refresh_combined_{screen_id}")
+        render_split_screen(conn, cfg["left"], cfg["right"], cfg["name"])
+        return
 
     if screens.empty or int(screen_id) not in screens["id"].tolist():
         st.error(f"Screen {screen_id} ist nicht konfiguriert.")
