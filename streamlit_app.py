@@ -890,7 +890,10 @@ def render_zone_overview_screen(conn, screen_id: int):
         _, zone_data = get_screen_data(conn, zid)
         zone_name = ZONE_NAME_MAP.get(zid, f"Zone {zid}")
 
-        st.markdown(f"<div class='zone-overview-card'><div class='zone-overview-title'>{zone_name}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='zone-overview-card'><div class='zone-overview-title'>{zone_name}</div>",
+            unsafe_allow_html=True
+        )
 
         if zone_data is None or zone_data.empty:
             st.info("Keine Abfahrten im Zeitfenster.")
@@ -908,13 +911,14 @@ def render_zone_overview_screen(conn, screen_id: int):
                 rows.append([
                     ensure_tz(r["datetime"]).strftime("%H:%M"),
                     r["location_name"],
+                    zone_name,
                     info,
                 ])
                 row_colors.append(r.get("location_color") or "")
                 text_colors.append(r.get("location_text_color") or "")
 
             render_big_table(
-                ["Zeit", "Einrichtung", "Hinweis / Countdown"],
+                ["Zeit", "Einrichtung", "Zone", "Hinweis / Countdown"],
                 rows,
                 row_colors=row_colors,
                 text_colors=text_colors,
@@ -936,12 +940,13 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
             border: 3px solid #1f2937;
             border-radius: 20px;
             box-shadow: 0 18px 45px rgba(0,0,0,0.28);
-        }
+        } 
         .split-divider {
-            min-height: 72vh;
-            background: linear-gradient(180deg, #6b7280 0%, #d1d5db 50%, #6b7280 100%);
-            border-radius: 6px;
-        }
+    min-height: 72vh;
+    background: #9ca3af;
+    border-radius: 3px;
+}
+        
         .split-monitor-title {
             margin: 0 0 14px 0;
             font-size: 34px !important;
@@ -984,7 +989,7 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
     left_name = left_screen["name"] if left_screen is not None else f"Screen {left_screen_id}"
     right_name = right_screen["name"] if right_screen is not None else f"Screen {right_screen_id}"
 
-    col1, colmid, col2 = st.columns([1, 0.006, 1])
+    col1, colmid, col2 = st.columns([1, 0.002, 1])
 
     with col1:
         st.markdown(f"<div class='split-monitor-card'><div class='split-monitor-title'>{left_name}</div>", unsafe_allow_html=True)
