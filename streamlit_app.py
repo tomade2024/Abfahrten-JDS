@@ -835,7 +835,6 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None):
         </table>
     """, unsafe_allow_html=True)
 
-
 def render_zone_overview_screen(conn, screen_id: int):
     st.markdown(
         """
@@ -847,13 +846,6 @@ def render_zone_overview_screen(conn, screen_id: int):
             padding: 16px;
             margin-bottom: 18px;
             box-shadow: 0 10px 24px rgba(0,0,0,0.22);
-        }
-        .zone-overview-title {
-            color: white;
-            font-size: 30px !important;
-            font-weight: 900;
-            margin-bottom: 12px;
-            text-transform: uppercase;
         }
         .big-table {
             width: 100%;
@@ -885,45 +877,46 @@ def render_zone_overview_screen(conn, screen_id: int):
     st.caption(f"DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h")
 
     zone_ids = [1, 2, 3, 4, 8, 9]
+    all_rows = []
+    row_colors = []
+    text_colors = []
 
     for zid in zone_ids:
         _, zone_data = get_screen_data(conn, zid)
         zone_name = ZONE_NAME_MAP.get(zid, f"Zone {zid}")
 
-        st.markdown(
-            f"<div class='zone-overview-card'><div class='zone-overview-title'>{zone_name}</div>",
-            unsafe_allow_html=True
+        if zone_data is None or zone_data.empty:
+            continue
+
+        for _, r in zone_data.iterrows():
+            info = str(r.get("note") or "")
+            li = str(r.get("line_info") or "")
+            if li:
+                info = (info + " · " if info else "") + li
+
+            all_rows.append([
+                ensure_tz(r["datetime"]).strftime("%H:%M"),
+                r["location_name"],
+                zone_name,
+                info,
+            ])
+            row_colors.append(r.get("location_color") or "")
+            text_colors.append(r.get("location_text_color") or "")
+
+    st.markdown("<div class='zone-overview-card'>", unsafe_allow_html=True)
+
+    if not all_rows:
+        st.info("Keine Abfahrten im Zeitfenster.")
+    else:
+        render_big_table(
+            ["Zeit", "Einrichtung", "Zone", "Hinweis / Countdown"],
+            all_rows,
+            row_colors=row_colors,
+            text_colors=text_colors,
         )
 
-        if zone_data is None or zone_data.empty:
-            st.info("Keine Abfahrten im Zeitfenster.")
-        else:
-            rows = []
-            row_colors = []
-            text_colors = []
+    st.markdown("</div>", unsafe_allow_html=True)
 
-            for _, r in zone_data.iterrows():
-                info = str(r.get("note") or "")
-                li = str(r.get("line_info") or "")
-                if li:
-                    info = (info + " · " if info else "") + li
-
-                rows.append([
-                    ensure_tz(r["datetime"]).strftime("%H:%M"),
-                    r["location_name"],
-                    info,
-                ])
-                row_colors.append(r.get("location_color") or "")
-                text_colors.append(r.get("location_text_color") or "")
-
-            render_big_table(
-                ["Zeit", "Einrichtung", "Hinweis / Countdown"],
-                rows,
-                row_colors=row_colors,
-                text_colors=text_colors,
-            )
-
-        st.markdown("</div>", unsafe_allow_html=True)
 
     screens = load_screens(conn)
     screen_row = screens.loc[screens["id"] == int(screen_id)].iloc[0]
@@ -973,13 +966,19 @@ def render_zone_overview_screen(conn, screen_id: int):
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-
 def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: str):
     left_screen, left_data = get_screen_data(conn, left_screen_id)
     right_screen, right_data = get_screen_data(conn, right_screen_id)
 
     st.markdown("""
         <style>
+        .split-top-row {
+            display: flex;
+            align-items: stretch;
+            width: 100%;
+            gap: 0;
+            margin-top: 8px;
+        }
         .split-monitor-card {
             background: #111827;
             padding: 18px 18px 12px 18px;
@@ -987,19 +986,29 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
             border: 3px solid #1f2937;
             border-radius: 20px;
             box-shadow: 0 18px 45px rgba(0,0,0,0.28);
-        } 
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .split-divider-wrap {
+            display: flex;
+            align-items: stretch;
+            justify-content: center;
+            padding: 0 2px;
+        }
         .split-divider {
-    min-height: 72vh;
-    background: #9ca3af;
-    border-radius: 3px;
-}
-        
+            width: 2px;
+            min-height: 72vh;
+            background: #cbd5e1;
+            border-radius: 2px;
+            margin-top: 0;
+        }
         .split-monitor-title {
             margin: 0 0 14px 0;
-            font-size: 34px !important;
-            font-weight: 900;
+            font-size: 22px !important;
+            font-weight: 800;
             color: #ffffff;
             text-transform: uppercase;
+            line-height: 1.2;
         }
         .split-empty {
             background: #1f2937;
@@ -1036,7 +1045,7 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
     left_name = left_screen["name"] if left_screen is not None else f"Screen {left_screen_id}"
     right_name = right_screen["name"] if right_screen is not None else f"Screen {right_screen_id}"
 
-    col1, colmid, col2 = st.columns([1, 0.002, 1])
+    col1, colmid, col2 = st.columns([1, 0.0015, 1])
 
     with col1:
         st.markdown(f"<div class='split-monitor-card'><div class='split-monitor-title'>{left_name}</div>", unsafe_allow_html=True)
@@ -1049,14 +1058,23 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
                 li = str(r.get("line_info") or "")
                 if li:
                     info = (info + " · " if info else "") + li
-                rows.append([ensure_tz(r["datetime"]).strftime("%H:%M"), r["location_name"], info])
+                rows.append([
+                    ensure_tz(r["datetime"]).strftime("%H:%M"),
+                    r["location_name"],
+                    info
+                ])
                 row_colors.append(r.get("location_color") or "")
                 text_colors.append(r.get("location_text_color") or "")
-            render_big_table(["Zeit", "Einrichtung", "Hinweis / Countdown"], rows, row_colors=row_colors, text_colors=text_colors)
+            render_big_table(
+                ["Zeit", "Einrichtung", "Hinweis / Countdown"],
+                rows,
+                row_colors=row_colors,
+                text_colors=text_colors,
+            )
         st.markdown("</div>", unsafe_allow_html=True)
 
     with colmid:
-        st.markdown("<div class='split-divider'>&nbsp;</div>", unsafe_allow_html=True)
+        st.markdown("<div class='split-divider'></div>", unsafe_allow_html=True)
 
     with col2:
         st.markdown(f"<div class='split-monitor-card'><div class='split-monitor-title'>{right_name}</div>", unsafe_allow_html=True)
@@ -1069,12 +1087,21 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
                 li = str(r.get("line_info") or "")
                 if li:
                     info = (info + " · " if info else "") + li
-                rows.append([ensure_tz(r["datetime"]).strftime("%H:%M"), r["location_name"], info])
+                rows.append([
+                    ensure_tz(r["datetime"]).strftime("%H:%M"),
+                    r["location_name"],
+                    info
+                ])
                 row_colors.append(r.get("location_color") or "")
                 text_colors.append(r.get("location_text_color") or "")
-            render_big_table(["Zeit", "Einrichtung","Zone", "Hinweis / Countdown"], rows, row_colors=row_colors, text_colors=text_colors)
+            render_big_table(
+                ["Zeit", "Einrichtung", "Hinweis / Countdown"],
+                rows,
+                row_colors=row_colors,
+                text_colors=text_colors,
+            )
         st.markdown("</div>", unsafe_allow_html=True)
-
+        
 # ==================================================
 # ADMIN VIEWS
 # ==================================================
