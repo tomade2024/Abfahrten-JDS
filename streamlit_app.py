@@ -194,6 +194,66 @@ def escape_html(text: str) -> str:
 # DATENBANK
 # ==================================================
 
+def load_departures_with_locations(conn):
+    try:
+        df = read_df(conn, """
+            SELECT d.id AS id,
+                   d.datetime AS datetime,
+                   d.location_id AS location_id,
+                   d.vehicle AS vehicle,
+                   d.status AS status,
+                   d.note AS note,
+                   d.ready_at AS ready_at,
+                   d.completed_at AS completed_at,
+                   d.source_key AS source_key,
+                   d.created_by AS created_by,
+                   d.screen_id AS screen_id,
+                   d.countdown_enabled AS countdown_enabled,
+                   l.name AS location_name,
+                   l.type AS location_type,
+                   l.active AS location_active,
+                   l.color AS location_color,
+                   l.text_color AS location_text_color
+            FROM departures d
+            JOIN locations l ON d.location_id = l.id
+        """)
+    except Exception:
+        df = pd.DataFrame()
+
+    required = {
+        "id": None,
+        "datetime": None,
+        "location_id": None,
+        "vehicle": "",
+        "status": "GEPLANT",
+        "note": "",
+        "ready_at": None,
+        "completed_at": None,
+        "source_key": "",
+        "created_by": "",
+        "screen_id": None,
+        "countdown_enabled": 1,
+        "location_name": "",
+        "location_type": "",
+        "location_active": 1,
+        "location_color": "",
+        "location_text_color": "",
+    }
+
+    for col, default in required.items():
+        if col not in df.columns:
+            df[col] = default
+
+    if not df.empty:
+        for col in ["datetime", "ready_at", "completed_at"]:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+            df[col] = df[col].apply(lambda x: ensure_tz(x) if pd.notnull(x) else x)
+
+        df["countdown_enabled"] = pd.to_numeric(
+            df["countdown_enabled"], errors="coerce"
+        ).fillna(1).astype(int)
+
+    return df
 
 def integrity_ok(conn: sqlite3.Connection) -> bool:
     try:
