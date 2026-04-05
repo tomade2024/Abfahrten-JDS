@@ -657,6 +657,90 @@ def import_backup_json(conn, data: dict):
 # BUSINESS LOGIC
 # ==================================================
 
+def render_zone_overview_screen(conn, screen_id: int):
+    st.markdown(
+        """
+        <style>
+        .zone-overview-card {
+            background: #111827;
+            border: 2px solid #1f2937;
+            border-radius: 18px;
+            padding: 16px;
+            margin-bottom: 18px;
+            box-shadow: 0 10px 24px rgba(0,0,0,0.22);
+        }
+        .zone-overview-title {
+            color: white;
+            font-size: 30px !important;
+            font-weight: 900;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+        }
+        .big-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        .big-table th, .big-table td {
+            border-bottom: 1px solid #d1d5db;
+            padding: 0.55em 0.9em;
+            text-align: left;
+            vertical-align: top;
+        }
+        .big-table th {
+            background: #e5e7eb;
+            color: #111827;
+            font-weight: 900;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    screens = load_screens(conn)
+    screen_row = screens.loc[screens["id"] == int(screen_id)].iloc[0]
+    st.markdown(f"## {screen_row['name']} (Screen {screen_id})")
+    st.caption(f"DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h")
+
+    zone_ids = [1, 2, 3, 4, 8, 9]
+
+    for zid in zone_ids:
+        zone_screen, zone_data = get_screen_data(conn, zid)
+        zone_name = ZONE_NAME_MAP.get(zid, f"Zone {zid}")
+
+        st.markdown(f"<div class='zone-overview-card'><div class='zone-overview-title'>{zone_name}</div>", unsafe_allow_html=True)
+
+        if zone_data is None or zone_data.empty:
+            st.info("Keine Abfahrten im Zeitfenster.")
+        else:
+            rows = []
+            row_colors = []
+            text_colors = []
+
+            for _, r in zone_data.iterrows():
+                info = str(r.get("note") or "")
+                li = str(r.get("line_info") or "")
+                if li:
+                    info = (info + " · " if info else "") + li
+
+                rows.append([
+                    ensure_tz(r["datetime"]).strftime("%H:%M"),
+                    r["location_name"],
+                    info,
+                ])
+                row_colors.append(r.get("location_color") or "")
+                text_colors.append(r.get("location_text_color") or "")
+
+            render_big_table(
+                ["Zeit", "Einrichtung", "Hinweis / Countdown"],
+                rows,
+                row_colors=row_colors,
+                text_colors=text_colors,
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
 def update_departure_statuses(conn: sqlite3.Connection):
     now = now_berlin()
@@ -842,7 +926,7 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
         .split-divider {
             min-height: 72vh;
             background: linear-gradient(180deg, #4b5563 0%, #9ca3af 50%, #4b5563 100%);
-            border-radius: 10px;
+            border-radius: 6px;
         }
         .split-monitor-title {
             margin: 0 0 14px 0;
@@ -886,7 +970,7 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
     left_name = left_screen["name"] if left_screen is not None else f"Screen {left_screen_id}"
     right_name = right_screen["name"] if right_screen is not None else f"Screen {right_screen_id}"
 
-    col1, colmid, col2 = st.columns([1, 0.02, 1])
+    col1, colmid, col2 = st.columns([1, 0.0006, 1])
 
     with col1:
         st.markdown(f"<div class='split-monitor-card'><div class='split-monitor-title'>{left_name}</div>", unsafe_allow_html=True)
@@ -1283,10 +1367,16 @@ def show_display_mode(screen_id: int):
     update_departure_statuses(conn)
     screens = load_screens(conn)
 
-    if int(screen_id) in COMBINED_SCREEN_MAP:
+        if int(screen_id) in COMBINED_SCREEN_MAP:
         cfg = COMBINED_SCREEN_MAP[int(screen_id)]
         st_autorefresh(interval=15000, key=f"display_refresh_combined_{screen_id}")
         render_split_screen(conn, cfg["left"], cfg["right"], cfg["name"])
+        return
+
+    # Screens 5, 6, 7 als Zonen-Übersicht
+    if int(screen_id) in [5, 6, 7]:
+        st_autorefresh(interval=15000, key=f"display_refresh_zone_overview_{screen_id}")
+        render_zone_overview_screen(conn, int(screen_id))
         return
 
     if screens.empty or int(screen_id) not in screens["id"].tolist():
