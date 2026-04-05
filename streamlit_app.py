@@ -911,6 +911,53 @@ def render_zone_overview_screen(conn, screen_id: int):
                 rows.append([
                     ensure_tz(r["datetime"]).strftime("%H:%M"),
                     r["location_name"],
+                    info,
+                ])
+                row_colors.append(r.get("location_color") or "")
+                text_colors.append(r.get("location_text_color") or "")
+
+            render_big_table(
+                ["Zeit", "Einrichtung", "Hinweis / Countdown"],
+                rows,
+                row_colors=row_colors,
+                text_colors=text_colors,
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    screens = load_screens(conn)
+    screen_row = screens.loc[screens["id"] == int(screen_id)].iloc[0]
+
+    st.markdown(f"## {screen_row['name']} (Screen {screen_id})")
+    st.caption(f"DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h")
+
+    zone_ids = [1, 2, 3, 4, 8, 9]
+
+    for zid in zone_ids:
+        _, zone_data = get_screen_data(conn, zid)
+        zone_name = ZONE_NAME_MAP.get(zid, f"Zone {zid}")
+
+        st.markdown(
+            f"<div class='zone-overview-card'><div class='zone-overview-title'>{zone_name}</div>",
+            unsafe_allow_html=True
+        )
+
+        if zone_data is None or zone_data.empty:
+            st.info("Keine Abfahrten im Zeitfenster.")
+        else:
+            rows = []
+            row_colors = []
+            text_colors = []
+
+            for _, r in zone_data.iterrows():
+                info = str(r.get("note") or "")
+                li = str(r.get("line_info") or "")
+                if li:
+                    info = (info + " · " if info else "") + li
+
+                rows.append([
+                    ensure_tz(r["datetime"]).strftime("%H:%M"),
+                    r["location_name"],
                     zone_name,
                     info,
                 ])
@@ -1025,7 +1072,7 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
                 rows.append([ensure_tz(r["datetime"]).strftime("%H:%M"), r["location_name"], info])
                 row_colors.append(r.get("location_color") or "")
                 text_colors.append(r.get("location_text_color") or "")
-            render_big_table(["Zeit", "Einrichtung", "Hinweis / Countdown"], rows, row_colors=row_colors, text_colors=text_colors)
+            render_big_table(["Zeit", "Einrichtung","Zone", "Hinweis / Countdown"], rows, row_colors=row_colors, text_colors=text_colors)
         st.markdown("</div>", unsafe_allow_html=True)
 
 # ==================================================
