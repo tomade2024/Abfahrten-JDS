@@ -75,10 +75,12 @@ BASE_DIR = get_base_dir()
 DATA_DIR = BASE_DIR / "daten"
 BACKUP_DIR = BASE_DIR / "backups"
 EXPORT_DIR = BASE_DIR / "exporte"
+
 for d in [DATA_DIR, BACKUP_DIR, EXPORT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "abfahrten.db"
+
 OLD_DB = Path("abfahrten.db")
 if not DB_PATH.exists() and OLD_DB.exists() and OLD_DB.resolve() != DB_PATH.resolve():
     try:
@@ -194,66 +196,6 @@ def escape_html(text: str) -> str:
 # DATENBANK
 # ==================================================
 
-def load_departures_with_locations(conn):
-    try:
-        df = read_df(conn, """
-            SELECT d.id AS id,
-                   d.datetime AS datetime,
-                   d.location_id AS location_id,
-                   d.vehicle AS vehicle,
-                   d.status AS status,
-                   d.note AS note,
-                   d.ready_at AS ready_at,
-                   d.completed_at AS completed_at,
-                   d.source_key AS source_key,
-                   d.created_by AS created_by,
-                   d.screen_id AS screen_id,
-                   d.countdown_enabled AS countdown_enabled,
-                   l.name AS location_name,
-                   l.type AS location_type,
-                   l.active AS location_active,
-                   l.color AS location_color,
-                   l.text_color AS location_text_color
-            FROM departures d
-            JOIN locations l ON d.location_id = l.id
-        """)
-    except Exception:
-        df = pd.DataFrame()
-
-    required = {
-        "id": None,
-        "datetime": None,
-        "location_id": None,
-        "vehicle": "",
-        "status": "GEPLANT",
-        "note": "",
-        "ready_at": None,
-        "completed_at": None,
-        "source_key": "",
-        "created_by": "",
-        "screen_id": None,
-        "countdown_enabled": 1,
-        "location_name": "",
-        "location_type": "",
-        "location_active": 1,
-        "location_color": "",
-        "location_text_color": "",
-    }
-
-    for col, default in required.items():
-        if col not in df.columns:
-            df[col] = default
-
-    if not df.empty:
-        for col in ["datetime", "ready_at", "completed_at"]:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-            df[col] = df[col].apply(lambda x: ensure_tz(x) if pd.notnull(x) else x)
-
-        df["countdown_enabled"] = pd.to_numeric(
-            df["countdown_enabled"], errors="coerce"
-        ).fillna(1).astype(int)
-
-    return df
 
 def integrity_ok(conn: sqlite3.Connection) -> bool:
     try:
@@ -480,32 +422,64 @@ def load_tour_stops(conn, tour_id: int):
 
 
 def load_departures_with_locations(conn):
-    df = read_df(conn, """
-        SELECT d.id AS id,
-               d.datetime AS datetime,
-               d.location_id AS location_id,
-               d.vehicle AS vehicle,
-               d.status AS status,
-               d.note AS note,
-               d.ready_at AS ready_at,
-               d.completed_at AS completed_at,
-               d.source_key AS source_key,
-               d.created_by AS created_by,
-               d.screen_id AS screen_id,
-               d.countdown_enabled AS countdown_enabled,
-               l.name AS location_name,
-               l.type AS location_type,
-               l.active AS location_active,
-               l.color AS location_color,
-               l.text_color AS location_text_color
-        FROM departures d
-        JOIN locations l ON d.location_id = l.id
-    """)
+    try:
+        df = read_df(conn, """
+            SELECT d.id AS id,
+                   d.datetime AS datetime,
+                   d.location_id AS location_id,
+                   d.vehicle AS vehicle,
+                   d.status AS status,
+                   d.note AS note,
+                   d.ready_at AS ready_at,
+                   d.completed_at AS completed_at,
+                   d.source_key AS source_key,
+                   d.created_by AS created_by,
+                   d.screen_id AS screen_id,
+                   d.countdown_enabled AS countdown_enabled,
+                   l.name AS location_name,
+                   l.type AS location_type,
+                   l.active AS location_active,
+                   l.color AS location_color,
+                   l.text_color AS location_text_color
+            FROM departures d
+            JOIN locations l ON d.location_id = l.id
+        """)
+    except Exception:
+        df = pd.DataFrame()
+
+    required = {
+        "id": None,
+        "datetime": None,
+        "location_id": None,
+        "vehicle": "",
+        "status": "GEPLANT",
+        "note": "",
+        "ready_at": None,
+        "completed_at": None,
+        "source_key": "",
+        "created_by": "",
+        "screen_id": None,
+        "countdown_enabled": 1,
+        "location_name": "",
+        "location_type": "",
+        "location_active": 1,
+        "location_color": "",
+        "location_text_color": "",
+    }
+
+    for col, default in required.items():
+        if col not in df.columns:
+            df[col] = default
+
     if not df.empty:
         for col in ["datetime", "ready_at", "completed_at"]:
             df[col] = pd.to_datetime(df[col], errors="coerce")
             df[col] = df[col].apply(lambda x: ensure_tz(x) if pd.notnull(x) else x)
-        df["countdown_enabled"] = pd.to_numeric(df["countdown_enabled"], errors="coerce").fillna(1).astype(int)
+
+        df["countdown_enabled"] = pd.to_numeric(
+            df["countdown_enabled"], errors="coerce"
+        ).fillna(1).astype(int)
+
     return df
 
 # ==================================================
@@ -516,7 +490,7 @@ def load_departures_with_locations(conn):
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     out = io.StringIO()
     df.to_csv(out, index=False, sep=";", encoding="utf-8")
-    return ("﻿" + out.getvalue()).encode("utf-8")
+    return ("\ufeff" + out.getvalue()).encode("utf-8")
 
 
 def export_locations_csv(conn) -> bytes:
@@ -527,6 +501,7 @@ def export_tours_csv(conn) -> tuple[bytes, bytes]:
     tours = load_tours(conn)
     if tours.empty:
         return df_to_csv_bytes(pd.DataFrame()), df_to_csv_bytes(pd.DataFrame())
+
     tours_df = tours[["id", "name", "weekday", "hour", "minute", "note", "active", "screen_ids", "countdown_enabled", "location_id", "location_name"]].copy()
     stop_rows = []
     for _, t in tours.iterrows():
@@ -657,90 +632,6 @@ def import_backup_json(conn, data: dict):
 # BUSINESS LOGIC
 # ==================================================
 
-def render_zone_overview_screen(conn, screen_id: int):
-    st.markdown(
-        """
-        <style>
-        .zone-overview-card {
-            background: #111827;
-            border: 2px solid #1f2937;
-            border-radius: 18px;
-            padding: 16px;
-            margin-bottom: 18px;
-            box-shadow: 0 10px 24px rgba(0,0,0,0.22);
-        }
-        .zone-overview-title {
-            color: white;
-            font-size: 30px !important;
-            font-weight: 900;
-            margin-bottom: 12px;
-            text-transform: uppercase;
-        }
-        .big-table {
-            width: 100%;
-            border-collapse: collapse;
-            background: white;
-            border-radius: 12px;
-            overflow: hidden;
-        }
-        .big-table th, .big-table td {
-            border-bottom: 1px solid #d1d5db;
-            padding: 0.55em 0.9em;
-            text-align: left;
-            vertical-align: top;
-        }
-        .big-table th {
-            background: #e5e7eb;
-            color: #111827;
-            font-weight: 900;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    screens = load_screens(conn)
-    screen_row = screens.loc[screens["id"] == int(screen_id)].iloc[0]
-    st.markdown(f"## {screen_row['name']} (Screen {screen_id})")
-    st.caption(f"DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h")
-
-    zone_ids = [1, 2, 3, 4, 8, 9]
-
-    for zid in zone_ids:
-        zone_screen, zone_data = get_screen_data(conn, zid)
-        zone_name = ZONE_NAME_MAP.get(zid, f"Zone {zid}")
-
-        st.markdown(f"<div class='zone-overview-card'><div class='zone-overview-title'>{zone_name}</div>", unsafe_allow_html=True)
-
-        if zone_data is None or zone_data.empty:
-            st.info("Keine Abfahrten im Zeitfenster.")
-        else:
-            rows = []
-            row_colors = []
-            text_colors = []
-
-            for _, r in zone_data.iterrows():
-                info = str(r.get("note") or "")
-                li = str(r.get("line_info") or "")
-                if li:
-                    info = (info + " · " if info else "") + li
-
-                rows.append([
-                    ensure_tz(r["datetime"]).strftime("%H:%M"),
-                    r["location_name"],
-                    info,
-                ])
-                row_colors.append(r.get("location_color") or "")
-                text_colors.append(r.get("location_text_color") or "")
-
-            render_big_table(
-                ["Zeit", "Einrichtung", "Hinweis / Countdown"],
-                rows,
-                row_colors=row_colors,
-                text_colors=text_colors,
-            )
-
-        st.markdown("</div>", unsafe_allow_html=True)
 
 def update_departure_statuses(conn: sqlite3.Connection):
     now = now_berlin()
@@ -824,7 +715,7 @@ def create_manual_departures(conn, dep_dt: datetime, location_id: int, screen_id
 
 def get_screen_data(conn, screen_id: int):
     screens = load_screens(conn)
-    if screens.empty or screen_id not in screens["id"].tolist():
+    if screens.empty or "id" not in screens.columns or screen_id not in screens["id"].tolist():
         return None, pd.DataFrame()
 
     screen = screens.loc[screens["id"] == screen_id].iloc[0]
@@ -833,21 +724,46 @@ def get_screen_data(conn, screen_id: int):
     start = now - timedelta(minutes=AUTO_COMPLETE_AFTER_MIN)
 
     deps = load_departures_with_locations(conn)
-    if deps.empty:
-        return screen, deps
 
-    deps = deps[deps["location_active"] == 1].copy()
+    required_cols = [
+        "datetime", "location_active", "screen_id", "location_type", "location_id",
+        "status", "completed_at", "countdown_enabled", "note", "line_info",
+        "location_name", "location_color", "location_text_color"
+    ]
+
+    if deps is None or deps.empty:
+        return screen, pd.DataFrame(columns=required_cols)
+
+    for col in required_cols:
+        if col not in deps.columns:
+            deps[col] = None
+
+    deps = deps.copy()
+    deps = deps[deps["location_active"] == 1]
     deps = deps[(deps["screen_id"].isna()) | (deps["screen_id"] == int(screen_id))]
 
-    if screen["filter_type"] != "ALLE":
+    if str(screen.get("filter_type", "ALLE")) != "ALLE":
         deps = deps[deps["location_type"] == screen["filter_type"]]
 
-    if (screen["filter_locations"] or "").strip():
-        ids = [int(x.strip()) for x in str(screen["filter_locations"]).split(",") if x.strip().isdigit()]
+    filter_locations = str(screen.get("filter_locations", "") or "").strip()
+    if filter_locations:
+        ids = [int(x.strip()) for x in filter_locations.split(",") if x.strip().isdigit()]
         if ids:
             deps = deps[deps["location_id"].isin(ids)]
 
+    deps["datetime"] = pd.to_datetime(deps["datetime"], errors="coerce")
+    deps = deps.dropna(subset=["datetime"]).copy()
+
+    if deps.empty:
+        deps["line_info"] = []
+        return screen, deps
+
+    deps["datetime"] = deps["datetime"].apply(ensure_tz)
     deps = deps[(deps["datetime"] >= start) & (deps["datetime"] <= end)].copy()
+
+    if deps.empty:
+        deps["line_info"] = []
+        return screen, deps
 
     def visible(row):
         status = str(row.get("status") or "").upper()
@@ -860,23 +776,34 @@ def get_screen_data(conn, screen_id: int):
 
     deps = deps[deps.apply(visible, axis=1)].copy()
 
+    if deps.empty:
+        deps["line_info"] = []
+        return screen, deps
+
     def build_line_info(row):
         cd_on = int(row.get("countdown_enabled", 1) or 1) == 1
         if not cd_on:
             return ""
+
         status = str(row.get("status") or "").upper()
         dep_dt = ensure_tz(row["datetime"])
+
         if status == "GEPLANT":
             delta = dep_dt - now
             if timedelta(0) <= delta <= timedelta(hours=COUNTDOWN_START_HOURS):
                 return f"Countdown: {fmt_compact(delta)}"
             return ""
+
         if status == "BEREIT":
             return f"Abschluss in {fmt_compact(completion_deadline(dep_dt) - now)}"
+
         return ""
 
     deps["line_info"] = [build_line_info(row) for _, row in deps.iterrows()]
-    deps = deps.sort_values("datetime").copy()
+
+    if "datetime" in deps.columns:
+        deps = deps.sort_values("datetime").copy()
+
     return screen, deps
 
 # ==================================================
@@ -909,6 +836,93 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None):
     """, unsafe_allow_html=True)
 
 
+def render_zone_overview_screen(conn, screen_id: int):
+    st.markdown(
+        """
+        <style>
+        .zone-overview-card {
+            background: #111827;
+            border: 2px solid #1f2937;
+            border-radius: 18px;
+            padding: 16px;
+            margin-bottom: 18px;
+            box-shadow: 0 10px 24px rgba(0,0,0,0.22);
+        }
+        .zone-overview-title {
+            color: white;
+            font-size: 30px !important;
+            font-weight: 900;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+        }
+        .big-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        .big-table th, .big-table td {
+            border-bottom: 1px solid #d1d5db;
+            padding: 0.55em 0.9em;
+            text-align: left;
+            vertical-align: top;
+        }
+        .big-table th {
+            background: #e5e7eb;
+            color: #111827;
+            font-weight: 900;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    screens = load_screens(conn)
+    screen_row = screens.loc[screens["id"] == int(screen_id)].iloc[0]
+
+    st.markdown(f"## {screen_row['name']} (Screen {screen_id})")
+    st.caption(f"DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h")
+
+    zone_ids = [1, 2, 3, 4, 8, 9]
+
+    for zid in zone_ids:
+        _, zone_data = get_screen_data(conn, zid)
+        zone_name = ZONE_NAME_MAP.get(zid, f"Zone {zid}")
+
+        st.markdown(f"<div class='zone-overview-card'><div class='zone-overview-title'>{zone_name}</div>", unsafe_allow_html=True)
+
+        if zone_data is None or zone_data.empty:
+            st.info("Keine Abfahrten im Zeitfenster.")
+        else:
+            rows = []
+            row_colors = []
+            text_colors = []
+
+            for _, r in zone_data.iterrows():
+                info = str(r.get("note") or "")
+                li = str(r.get("line_info") or "")
+                if li:
+                    info = (info + " · " if info else "") + li
+
+                rows.append([
+                    ensure_tz(r["datetime"]).strftime("%H:%M"),
+                    r["location_name"],
+                    info,
+                ])
+                row_colors.append(r.get("location_color") or "")
+                text_colors.append(r.get("location_text_color") or "")
+
+            render_big_table(
+                ["Zeit", "Einrichtung", "Hinweis / Countdown"],
+                rows,
+                row_colors=row_colors,
+                text_colors=text_colors,
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
 def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: str):
     left_screen, left_data = get_screen_data(conn, left_screen_id)
     right_screen, right_data = get_screen_data(conn, right_screen_id)
@@ -925,7 +939,7 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
         }
         .split-divider {
             min-height: 72vh;
-            background: linear-gradient(180deg, #4b5563 0%, #9ca3af 50%, #4b5563 100%);
+            background: linear-gradient(180deg, #6b7280 0%, #d1d5db 50%, #6b7280 100%);
             border-radius: 6px;
         }
         .split-monitor-title {
@@ -970,7 +984,7 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
     left_name = left_screen["name"] if left_screen is not None else f"Screen {left_screen_id}"
     right_name = right_screen["name"] if right_screen is not None else f"Screen {right_screen_id}"
 
-    col1, colmid, col2 = st.columns([1, 0.0006, 1])
+    col1, colmid, col2 = st.columns([1, 0.006, 1])
 
     with col1:
         st.markdown(f"<div class='split-monitor-card'><div class='split-monitor-title'>{left_name}</div>", unsafe_allow_html=True)
@@ -1367,13 +1381,12 @@ def show_display_mode(screen_id: int):
     update_departure_statuses(conn)
     screens = load_screens(conn)
 
-        if int(screen_id) in COMBINED_SCREEN_MAP:
+    if int(screen_id) in COMBINED_SCREEN_MAP:
         cfg = COMBINED_SCREEN_MAP[int(screen_id)]
         st_autorefresh(interval=15000, key=f"display_refresh_combined_{screen_id}")
         render_split_screen(conn, cfg["left"], cfg["right"], cfg["name"])
         return
 
-    # Screens 5, 6, 7 als Zonen-Übersicht
     if int(screen_id) in [5, 6, 7]:
         st_autorefresh(interval=15000, key=f"display_refresh_zone_overview_{screen_id}")
         render_zone_overview_screen(conn, int(screen_id))
@@ -1438,4 +1451,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
