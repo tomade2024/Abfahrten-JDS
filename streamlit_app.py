@@ -204,6 +204,7 @@ def parse_screen_ids(value) -> list[int]:
 def escape_html(text: str) -> str:
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+
 # ==================================================
 # LOGIN / LOGGING
 # ==================================================
@@ -300,6 +301,7 @@ def require_login():
             log_event(None, "login_failed", "auth", details={"username": username}, level="WARNING")
 
     st.stop()
+
 
 # ==================================================
 # DATENBANK
@@ -511,6 +513,7 @@ def get_connection():
     migrate_db(conn)
     return conn
 
+
 # ==================================================
 # DB HELPER
 # ==================================================
@@ -610,6 +613,7 @@ def load_departures_with_locations(conn):
         df["cooled_required"] = pd.to_numeric(df["cooled_required"], errors="coerce").fillna(0).astype(int)
 
     return df
+
 
 # ==================================================
 # EXPORT / IMPORT / BACKUP
@@ -791,6 +795,7 @@ def import_backup_json(conn, data: dict):
                 cur.execute("INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)", (int(tour_id), int(s["location_id"]), int(s.get("position", 0))))
 
     conn.commit()
+
 
 # ==================================================
 # BUSINESS LOGIC
@@ -1036,6 +1041,7 @@ def get_screen_data(conn, screen_id: int):
 
     return screen, deps
 
+
 # ==================================================
 # RENDERING / HTML
 # ==================================================
@@ -1128,6 +1134,53 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None, html_cols
           <tbody>{body}</tbody>
         </table>
     """, unsafe_allow_html=True)
+
+
+def render_display_header(title: str | None = None):
+    now = now_berlin()
+    weekday = WEEKDAYS_DE[now.weekday()]
+    line = f"{weekday}, {now.strftime('%d.%m.%Y')} • {now.strftime('%H:%M:%S')}"
+
+    if title:
+        st.markdown(
+            f"""
+            <div style="
+                display:flex;
+                justify-content:space-between;
+                align-items:center;
+                background:#111827;
+                color:white;
+                padding:10px 16px;
+                border-radius:14px;
+                margin-bottom:10px;
+                font-weight:800;
+            ">
+                <div style="font-size:30px;">{escape_html(title)}</div>
+                <div style="font-size:26px;">{escape_html(line)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"""
+            <div style="
+                display:flex;
+                justify-content:flex-end;
+                align-items:center;
+                background:#111827;
+                color:white;
+                padding:10px 16px;
+                border-radius:14px;
+                margin-bottom:10px;
+                font-weight:800;
+                font-size:26px;
+            ">
+                {escape_html(line)}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def base_display_css() -> str:
@@ -1284,8 +1337,7 @@ def render_zone_overview_screen(conn, screen_id: int):
     screens = load_screens(conn)
     screen_row = screens.loc[screens["id"] == int(screen_id)].iloc[0]
 
-    st.markdown(f"## {screen_row['name']} (Screen {screen_id})")
-    st.caption(f"DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h")
+    render_display_header(f"{screen_row['name']} (Screen {screen_id})")
 
     zone_ids = OVERVIEW_GROUPS.get(int(screen_id), [1, 2, 3, 4, 8, 9])
     all_rows = []
@@ -1335,18 +1387,21 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
     left_screen, left_data = get_screen_data(conn, left_screen_id)
     right_screen, right_data = get_screen_data(conn, right_screen_id)
 
+    left_zone_name = ZONE_NAME_MAP.get(left_screen_id, left_screen["name"] if left_screen is not None else f"Screen {left_screen_id}")
+    right_zone_name = ZONE_NAME_MAP.get(right_screen_id, right_screen["name"] if right_screen is not None else f"Screen {right_screen_id}")
+
     st.markdown("""
         <style>
         .split-monitor-card {
             background: #111827;
             padding: 8px 12px 10px 12px;
-            min-height: 94vh;
+            min-height: 90vh;
             border: 3px solid #1f2937;
             border-radius: 16px;
             box-shadow: 0 18px 45px rgba(0,0,0,0.28);
         }
         .split-divider {
-            min-height: 94vh;
+            min-height: 90vh;
             width: 1px;
             background: #d1d5db;
             border-radius: 1px;
@@ -1359,13 +1414,27 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
             font-size: 24px !important;
             border: 1px solid #374151;
         }
+        .split-zone-title {
+            color: #ffffff;
+            font-size: 28px !important;
+            font-weight: 900;
+            margin-bottom: 10px;
+            padding: 8px 10px;
+            background: #0f172a;
+            border-radius: 10px;
+            text-transform: uppercase;
+        }
         </style>
     """, unsafe_allow_html=True)
+
+    render_display_header(title)
 
     col1, colmid, col2 = st.columns([1, 0.0006, 1])
 
     with col1:
         st.markdown("<div class='split-monitor-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='split-zone-title'>{escape_html(left_zone_name)}</div>", unsafe_allow_html=True)
+
         if left_data is None or left_data.empty:
             st.markdown("<div class='split-empty'>Keine Abfahrten im Zeitfenster.</div>", unsafe_allow_html=True)
         else:
@@ -1393,6 +1462,8 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
 
     with col2:
         st.markdown("<div class='split-monitor-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='split-zone-title'>{escape_html(right_zone_name)}</div>", unsafe_allow_html=True)
+
         if right_data is None or right_data.empty:
             st.markdown("<div class='split-empty'>Keine Abfahrten im Zeitfenster.</div>", unsafe_allow_html=True)
         else:
@@ -1421,6 +1492,7 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
             f"<div class='ticker'><div class='ticker__inner'>{escape_html(ticker_text)}</div></div>",
             unsafe_allow_html=True
         )
+
 
 # ==================================================
 # ADMIN VIEWS
@@ -1892,75 +1964,107 @@ def show_admin_mode():
         st.session_state.clear()
         st.rerun()
 
-    st.markdown("### Wartung")
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        if st.button("DB prüfen"):
-            ok = integrity_ok(conn)
-            log_event(conn, "maintenance_check", "database", details={"integrity_ok": ok})
-            if ok:
-                st.success("Datenbank ist in Ordnung.")
-            else:
-                st.error("Datenbankprüfung fehlgeschlagen.")
-    with m2:
-        if st.button("Alte Tour-Abfahrten bereinigen"):
-            try:
-                cleanup_materialized_departures(conn)
-                log_event(conn, "maintenance_cleanup", "departures")
-                st.success("Bereinigung durchgeführt.")
-            except Exception as e:
-                log_event(conn, "error", "maintenance_cleanup", details={"message": str(e)}, level="ERROR")
-                st.error(f"Bereinigung fehlgeschlagen: {e}")
-    with m3:
-        if st.button("Sofort-Backup erstellen"):
-            try:
-                target = save_backup_to_dir(conn, prefix="backup_manual")
-                cleanup_old_backups()
-                log_event(conn, "maintenance_backup", "backup", details={"path": str(target)})
-                st.success(f"Backup erstellt: {target.name}")
-            except Exception as e:
-                log_event(conn, "error", "backup", details={"message": str(e)}, level="ERROR")
-                st.error(f"Backup fehlgeschlagen: {e}")
-
-    st.markdown("### Backup")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button("Backup herunterladen", data=export_backup_json(conn), file_name=f"backup_abfahrten_{now_berlin().strftime('%Y%m%d_%H%M%S')}.json", mime="application/json")
-        st.caption(f"Backup-Ordner: {BACKUP_DIR}")
-    with c2:
-        backup_file = st.file_uploader("Backup importieren (JSON)", type=["json"], key="backup_import_main")
-        if backup_file is not None and role == "admin":
-            try:
-                data = json.loads(backup_file.getvalue().decode("utf-8"))
-                import_backup_json(conn, data)
-                save_backup_to_dir(conn, prefix="backup_import")
-                cleanup_old_backups()
-                log_event(conn, "import", "backup", details={"filename": backup_file.name})
-                st.success("Backup importiert.")
-                st.rerun()
-            except Exception as e:
-                log_event(conn, "error", "backup_import", details={"message": str(e)}, level="ERROR")
-                st.error(f"Backup-Import fehlgeschlagen: {e}")
-
-    st.markdown("### Änderungsprotokoll")
-    audit_df = read_df(conn, "SELECT event_time, username, event_type, entity_type, entity_id, details_json FROM audit_log ORDER BY id DESC LIMIT 100")
-    if audit_df.empty:
-        st.info("Noch keine Protokolleinträge vorhanden.")
-    else:
-        st.dataframe(audit_df, use_container_width=True, height=220)
-
     can_edit = role == "admin"
-    tabs = st.tabs(["Abfahrten", "Einrichtungen", "Touren", "Kühlware", "Screens / Ticker"])
+
+    tabs = st.tabs([
+        "Abfahrten",
+        "Einrichtungen",
+        "Touren",
+        "Kühlware",
+        "Screens / Ticker",
+        "Wartung",
+        "Backup",
+        "Änderungsprotokoll",
+    ])
+
     with tabs[0]:
         show_admin_departures(conn, can_edit)
+
     with tabs[1]:
         show_admin_locations(conn, can_edit)
+
     with tabs[2]:
         show_admin_tours(conn, can_edit)
+
     with tabs[3]:
         show_admin_cold_goods(conn, can_edit)
+
     with tabs[4]:
         show_admin_screens(conn, can_edit)
+
+    with tabs[5]:
+        st.subheader("Wartung")
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            if st.button("DB prüfen"):
+                ok = integrity_ok(conn)
+                log_event(conn, "maintenance_check", "database", details={"integrity_ok": ok})
+                if ok:
+                    st.success("Datenbank ist in Ordnung.")
+                else:
+                    st.error("Datenbankprüfung fehlgeschlagen.")
+
+        with c2:
+            if st.button("Alte Tour-Abfahrten bereinigen"):
+                try:
+                    cleanup_materialized_departures(conn)
+                    log_event(conn, "maintenance_cleanup", "departures")
+                    st.success("Bereinigung durchgeführt.")
+                except Exception as e:
+                    log_event(conn, "error", "maintenance_cleanup", details={"message": str(e)}, level="ERROR")
+                    st.error(f"Bereinigung fehlgeschlagen: {e}")
+
+        with c3:
+            if st.button("Sofort-Backup erstellen"):
+                try:
+                    target = save_backup_to_dir(conn, prefix="backup_manual")
+                    cleanup_old_backups()
+                    log_event(conn, "maintenance_backup", "backup", details={"path": str(target)})
+                    st.success(f"Backup erstellt: {target.name}")
+                except Exception as e:
+                    log_event(conn, "error", "backup", details={"message": str(e)}, level="ERROR")
+                    st.error(f"Backup fehlgeschlagen: {e}")
+
+    with tabs[6]:
+        st.subheader("Backup")
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.download_button(
+                "Backup herunterladen",
+                data=export_backup_json(conn),
+                file_name=f"backup_abfahrten_{now_berlin().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json"
+            )
+            st.caption(f"Backup-Ordner: {BACKUP_DIR}")
+
+        with c2:
+            backup_file = st.file_uploader("Backup importieren (JSON)", type=["json"], key="backup_import_main")
+            if backup_file is not None and role == "admin":
+                try:
+                    data = json.loads(backup_file.getvalue().decode("utf-8"))
+                    import_backup_json(conn, data)
+                    save_backup_to_dir(conn, prefix="backup_import")
+                    cleanup_old_backups()
+                    log_event(conn, "import", "backup", details={"filename": backup_file.name})
+                    st.success("Backup importiert.")
+                    st.rerun()
+                except Exception as e:
+                    log_event(conn, "error", "backup_import", details={"message": str(e)}, level="ERROR")
+                    st.error(f"Backup-Import fehlgeschlagen: {e}")
+
+    with tabs[7]:
+        st.subheader("Änderungsprotokoll")
+        audit_df = read_df(
+            conn,
+            "SELECT event_time, username, event_type, entity_type, entity_id, details_json FROM audit_log ORDER BY id DESC LIMIT 200"
+        )
+        if audit_df.empty:
+            st.info("Noch keine Protokolleinträge vorhanden.")
+        else:
+            st.dataframe(audit_df, use_container_width=True, height=500)
+
 
 # ==================================================
 # DISPLAY MODE
@@ -2009,6 +2113,8 @@ def show_display_mode(screen_id: int):
         )
         return
 
+    render_display_header(f"{screen['name']} (Screen {screen_id})")
+
     _, data = get_screen_data(conn, int(screen_id))
     if data.empty:
         st.info("Keine Abfahrten im nächsten Zeitfenster.")
@@ -2027,6 +2133,7 @@ def show_display_mode(screen_id: int):
 
     if bool(screen.get("ticker_active", 0)) and str(screen.get("text", "") or "").strip():
         st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(screen['text'])}</div></div>", unsafe_allow_html=True)
+
 
 # ==================================================
 # MAIN
