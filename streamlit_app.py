@@ -7,6 +7,8 @@ import time
 import uuid
 import os
 import shutil
+import hashlib
+import hmac
 from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,6 +29,7 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_default_users": True,
         "require_secrets_in_production": False,
+        "password_iterations": 200000,
     },
     "users": {
         "admin": {"password": "admin123", "role": "admin"},
@@ -129,10 +132,15 @@ def load_config() -> dict:
     return cfg
 
 
+def save_config(cfg: dict):
+    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 APP_CONFIG = load_config()
 DEFAULT_USERS = APP_CONFIG["users"]
 ALLOW_DEFAULT_USERS = bool(APP_CONFIG.get("security", {}).get("allow_default_users", True))
 REQUIRE_SECRETS_IN_PRODUCTION = bool(APP_CONFIG.get("security", {}).get("require_secrets_in_production", False))
+PASSWORD_ITERATIONS = int(APP_CONFIG.get("security", {}).get("password_iterations", 200000))
 APP_LOG_PATH = LOG_DIR / "app.log"
 
 COUNTDOWN_START_HOURS = int(APP_CONFIG["display"]["countdown_start_hours"])
@@ -206,6 +214,64 @@ def escape_html(text: str) -> str:
 
 
 # ==================================================
+# PASSWORT / BENUTZER
+# ==================================================
+
+
+def hash_password(password: str, iterations: int = PASSWORD_ITERATIONS) -> str:
+    salt = os.urandom(16).hex()
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations)
+    return f"pbkdf2_sha256${iterations}${salt}${dk.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    if not stored:
+        return False
+
+    if stored.startswith("pbkdf2_sha256$"):
+        try:
+            _, iterations, salt, digest = stored.split("$", 3)
+            dk = hashlib.pbkdf2_hmac(
+                "sha256",
+                password.encode("utf-8"),
+                salt.encode("utf-8"),
+                int(iterations),
+            )
+            return hmac.compare_digest(dk.hex(), digest)
+        except Exception:
+            return False
+
+    return hmac.compare_digest(password, stored)
+
+
+def get_runtime_users() -> dict:
+    try:
+        secrets_users = st.secrets.get("users", None)
+        if secrets_users:
+            out = {}
+            for username, data in secrets_users.items():
+                out[str(username)] = {
+                    "password": str(data.get("password", "")),
+                    "role": str(data.get("role", "viewer")),
+                }
+            if out:
+                return out
+    except Exception:
+        pass
+
+    if REQUIRE_SECRETS_IN_PRODUCTION and not ALLOW_DEFAULT_USERS:
+        return {}
+
+    return APP_CONFIG.get("users", {}) if ALLOW_DEFAULT_USERS else {}
+
+
+def save_runtime_users(users: dict):
+    cfg = load_config()
+    cfg["users"] = users
+    save_config(cfg)
+
+
+# ==================================================
 # LOGIN / LOGGING
 # ==================================================
 
@@ -251,33 +317,12 @@ def run_safe(label: str, func, *args, **kwargs):
         return False, None
 
 
-def get_users():
-    try:
-        secrets_users = st.secrets.get("users", None)
-        if secrets_users:
-            out = {}
-            for username, data in secrets_users.items():
-                out[str(username)] = {
-                    "password": str(data.get("password", "")),
-                    "role": str(data.get("role", "viewer")),
-                }
-            if out:
-                return out
-    except Exception:
-        pass
-
-    if REQUIRE_SECRETS_IN_PRODUCTION and not ALLOW_DEFAULT_USERS:
-        return {}
-
-    return DEFAULT_USERS if ALLOW_DEFAULT_USERS else {}
-
-
 def require_login():
     if st.session_state.get("logged_in"):
         return
 
     st.title("Login")
-    users = get_users()
+    users = get_runtime_users()
     if not users:
         st.error("Keine Benutzer konfiguriert. Bitte users in secrets oder config.json hinterlegen.")
         st.stop()
@@ -289,7 +334,7 @@ def require_login():
 
     if submitted:
         user_entry = users.get(username)
-        if user_entry and user_entry["password"] == password:
+        if user_entry and verify_password(password, str(user_entry.get("password", ""))):
             st.session_state["logged_in"] = True
             st.session_state["role"] = user_entry["role"]
             st.session_state["username"] = username
@@ -949,6 +994,33 @@ def create_manual_departures(conn, dep_dt: datetime, location_id: int, screen_id
     })
 
 
+def update_manual_departure(conn, dep_id: int, dep_dt: datetime, location_id: int, screen_id: int, note: str, countdown_enabled: bool, cooled_required: bool):
+    conn.execute(
+        """
+        UPDATE departures
+        SET datetime=?, location_id=?, screen_id=?, note=?, countdown_enabled=?, cooled_required=?
+        WHERE id=? AND source_key LIKE 'MANUAL:%'
+        """,
+        (
+            dep_dt.isoformat(),
+            int(location_id),
+            int(screen_id),
+            (note or "").strip(),
+            1 if countdown_enabled else 0,
+            1 if cooled_required else 0,
+            int(dep_id),
+        ),
+    )
+    conn.commit()
+    log_event(conn, "update", "manual_departure", entity_id=dep_id, details={
+        "datetime": dep_dt.isoformat(),
+        "location_id": int(location_id),
+        "screen_id": int(screen_id),
+        "countdown_enabled": bool(countdown_enabled),
+        "cooled_required": bool(cooled_required),
+    })
+
+
 def get_screen_data(conn, screen_id: int):
     screens = load_screens(conn)
     if screens.empty or "id" not in screens.columns or screen_id not in screens["id"].tolist():
@@ -1043,7 +1115,7 @@ def get_screen_data(conn, screen_id: int):
 
 
 # ==================================================
-# RENDERING / HTML
+# V2 VISUAL HELPERS
 # ==================================================
 
 
@@ -1102,7 +1174,78 @@ def build_info_html(row) -> str:
     return " · ".join(parts)
 
 
-def render_big_table(headers, rows, row_colors=None, text_colors=None, html_cols=None):
+def is_next_departure(row, df: pd.DataFrame) -> bool:
+    try:
+        if df is None or df.empty:
+            return False
+        future = df[df["status"].fillna("").astype(str).str.upper().isin(["GEPLANT", "BEREIT"])].copy()
+        if future.empty:
+            return False
+        future = future.sort_values("datetime")
+        first_id = int(future.iloc[0]["id"])
+        return int(row["id"]) == first_id
+    except Exception:
+        return False
+
+
+def get_row_display_styles(row, df: pd.DataFrame):
+    base_bg = str(row.get("location_color") or "").strip()
+    base_text = str(row.get("location_text_color") or "").strip()
+
+    status = str(row.get("status") or "").upper()
+    cooled_required = int(row.get("cooled_required", 0) or 0) == 1
+
+    bg = base_bg
+    text = base_text
+    extra_css = ""
+
+    if status == "BEREIT":
+        bg = "#dcfce7"
+        text = "#166534"
+
+    if is_critical_countdown(row):
+        bg = "#fecaca"
+        text = "#7f1d1d"
+        extra_css = "font-weight:900;"
+    elif is_urgent_countdown(row):
+        bg = "#fed7aa"
+        text = "#9a3412"
+
+    if cooled_required and not bg:
+        bg = "#dbeafe"
+        text = "#1e3a8a"
+
+    if is_next_departure(row, df):
+        extra_css += "outline:4px solid #f59e0b; outline-offset:-4px;"
+
+    return bg, text, extra_css
+
+
+def build_display_rows(data: pd.DataFrame):
+    rows = []
+    row_backgrounds = []
+    text_colors = []
+    extra_css = []
+
+    if data is None or data.empty:
+        return rows, row_backgrounds, text_colors, extra_css
+
+    for _, r in data.iterrows():
+        info_html = build_info_html(r)
+        rows.append([
+            ensure_tz(r["datetime"]).strftime("%H:%M"),
+            r["location_name"],
+            info_html,
+        ])
+        bg, tc, ex = get_row_display_styles(r, data)
+        row_backgrounds.append(bg)
+        text_colors.append(tc)
+        extra_css.append(ex)
+
+    return rows, row_backgrounds, text_colors, extra_css
+
+
+def render_big_table_v2(headers, rows, row_backgrounds=None, text_colors=None, extra_row_css=None, html_cols=None):
     html_cols = set(html_cols or [])
     thead = "".join(f"<th>{escape_html(str(h))}</th>" for h in headers)
     body = ""
@@ -1110,14 +1253,22 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None, html_cols
     rows = list(rows)
     for idx, r in enumerate(rows):
         style_parts = []
-        if row_colors is not None and idx < len(row_colors):
-            bg = row_colors[idx] or ""
+
+        if row_backgrounds is not None and idx < len(row_backgrounds):
+            bg = row_backgrounds[idx] or ""
             if bg:
                 style_parts.append(f"background-color:{bg};")
+
         if text_colors is not None and idx < len(text_colors):
             tc = text_colors[idx] or ""
             if tc:
                 style_parts.append(f"color:{tc};")
+
+        if extra_row_css is not None and idx < len(extra_row_css):
+            ex = extra_row_css[idx] or ""
+            if ex:
+                style_parts.append(ex)
+
         style = f' style="{"".join(style_parts)}"' if style_parts else ""
 
         cells = []
@@ -1128,59 +1279,61 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None, html_cols
                 cells.append(f"<td>{escape_html(str(c or ''))}</td>")
         body += f"<tr{style}>{''.join(cells)}</tr>"
 
-    st.markdown(f"""
+    st.markdown(
+        f"""
         <table class="big-table">
           <thead><tr>{thead}</tr></thead>
           <tbody>{body}</tbody>
         </table>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-def render_display_header(title: str | None = None):
+def render_display_header(title: str | None = None, data: pd.DataFrame | None = None):
     now = now_berlin()
     weekday = WEEKDAYS_DE[now.weekday()]
     line = f"{weekday}, {now.strftime('%d.%m.%Y')} • {now.strftime('%H:%M:%S')}"
 
-    if title:
-        st.markdown(
-            f"""
-            <div style="
-                display:flex;
-                justify-content:space-between;
-                align-items:center;
-                background:#111827;
-                color:white;
-                padding:10px 16px;
-                border-radius:14px;
-                margin-bottom:10px;
-                font-weight:800;
-            ">
-                <div style="font-size:30px;">{escape_html(title)}</div>
+    summary_html = ""
+    if data is not None:
+        status_series = data["status"].fillna("").astype(str).str.upper() if not data.empty else pd.Series(dtype=str)
+        active = int((status_series == "GEPLANT").sum()) if not data.empty else 0
+        ready = int((status_series == "BEREIT").sum()) if not data.empty else 0
+        done = int((status_series == "ABGESCHLOSSEN").sum()) if not data.empty else 0
+
+        summary_html = f"""
+            <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end;margin-top:6px;">
+                <span style="background:#dbeafe;color:#1e3a8a;padding:4px 10px;border-radius:10px;font-weight:900;">Aktiv: {active}</span>
+                <span style="background:#dcfce7;color:#166534;padding:4px 10px;border-radius:10px;font-weight:900;">Bereit: {ready}</span>
+                <span style="background:#e5e7eb;color:#374151;padding:4px 10px;border-radius:10px;font-weight:900;">Fertig: {done}</span>
+            </div>
+        """
+
+    left_title = escape_html(title) if title else ""
+    st.markdown(
+        f"""
+        <div style="
+            display:flex;
+            justify-content:space-between;
+            align-items:flex-start;
+            gap:18px;
+            background:#111827;
+            color:white;
+            padding:10px 16px;
+            border-radius:14px;
+            margin-bottom:10px;
+            font-weight:800;
+        ">
+            <div style="font-size:30px;line-height:1.2;">{left_title}</div>
+            <div style="text-align:right;">
                 <div style="font-size:26px;">{escape_html(line)}</div>
+                {summary_html}
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            f"""
-            <div style="
-                display:flex;
-                justify-content:flex-end;
-                align-items:center;
-                background:#111827;
-                color:white;
-                padding:10px 16px;
-                border-radius:14px;
-                margin-bottom:10px;
-                font-weight:800;
-                font-size:26px;
-            ">
-                {escape_html(line)}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def base_display_css() -> str:
@@ -1197,17 +1350,18 @@ def base_display_css() -> str:
             height: 100vh !important;
             overflow: hidden !important;
             background: #0f172a !important;
+            cursor: none !important;
         }
 
         .block-container {
             max-width: 100vw !important;
             width: 100vw !important;
             height: 100vh !important;
-            padding: 0.2rem 0.4rem 3rem 0.4rem !important;
+            padding: 0.2rem 0.35rem 3rem 0.35rem !important;
             margin: 0 !important;
         }
 
-        body,.block-container,.stMarkdown,.stText,div,span {
+        body, .block-container, .stMarkdown, .stText, div, span {
             font-size: 34px !important;
         }
 
@@ -1219,9 +1373,9 @@ def base_display_css() -> str:
             overflow: hidden;
         }
 
-        .big-table th,.big-table td {
+        .big-table th, .big-table td {
             border-bottom: 1px solid #d1d5db;
-            padding: 0.72em 1em;
+            padding: 0.78em 1em;
             text-align: left;
             vertical-align: top;
         }
@@ -1253,14 +1407,14 @@ def base_display_css() -> str:
         }
 
         @keyframes ticker-scroll {
-            0% {transform:translateX(0);}
-            100% {transform:translateX(-100%);}
+            0% { transform: translateX(0); }
+            100% { transform: translateX(-100%); }
         }
 
         .blink-countdown {
             color:#b91c1c;
             font-weight:900;
-            animation:blinkUrgent 1s steps(2, start) infinite;
+            animation: blinkUrgent 1s steps(2, start) infinite;
         }
 
         .blink-countdown-critical {
@@ -1269,7 +1423,7 @@ def base_display_css() -> str:
             background:#fecaca;
             padding:0 6px;
             border-radius:6px;
-            animation:blinkCritical 0.7s steps(2, start) infinite;
+            animation: blinkCritical 0.7s steps(2, start) infinite;
         }
 
         .ready-badge {
@@ -1283,21 +1437,21 @@ def base_display_css() -> str:
         .cold-badge {
             color:#1e3a8a;
             font-weight:900;
-            background:#dbeafe;
+            background:#bfdbfe;
             padding:0 6px;
             border-radius:6px;
         }
 
         @keyframes blinkUrgent {
-            0% {opacity:1;}
-            50% {opacity:0.15;}
-            100% {opacity:1;}
+            0% { opacity:1; }
+            50% { opacity:0.15; }
+            100% { opacity:1; }
         }
 
         @keyframes blinkCritical {
-            0% {opacity:1;}
-            50% {opacity:0.05;}
-            100% {opacity:1;}
+            0% { opacity:1; }
+            50% { opacity:0.05; }
+            100% { opacity:1; }
         }
         </style>
     """
@@ -1337,12 +1491,13 @@ def render_zone_overview_screen(conn, screen_id: int):
     screens = load_screens(conn)
     screen_row = screens.loc[screens["id"] == int(screen_id)].iloc[0]
 
-    render_display_header(f"{screen_row['name']} (Screen {screen_id})")
-
     zone_ids = OVERVIEW_GROUPS.get(int(screen_id), [1, 2, 3, 4, 8, 9])
     all_rows = []
-    row_colors = []
+    row_backgrounds = []
     text_colors = []
+    extra_css = []
+
+    combined_df_parts = []
 
     for zid in zone_ids:
         _, zone_data = get_screen_data(conn, zid)
@@ -1350,6 +1505,8 @@ def render_zone_overview_screen(conn, screen_id: int):
 
         if zone_data is None or zone_data.empty:
             continue
+
+        combined_df_parts.append(zone_data.copy())
 
         for _, r in zone_data.iterrows():
             info_html = build_info_html(r)
@@ -1359,20 +1516,25 @@ def render_zone_overview_screen(conn, screen_id: int):
                 zone_name,
                 info_html,
             ])
-            row_colors.append(r.get("location_color") or "")
-            text_colors.append(r.get("location_text_color") or "")
+            bg, tc, ex = get_row_display_styles(r, zone_data)
+            row_backgrounds.append(bg)
+            text_colors.append(tc)
+            extra_css.append(ex)
+
+    combined_df = pd.concat(combined_df_parts, ignore_index=True) if combined_df_parts else pd.DataFrame()
+    render_display_header(f"{screen_row['name']} (Screen {screen_id})", combined_df)
 
     st.markdown("<div class='zone-overview-card'>", unsafe_allow_html=True)
 
     if not all_rows:
         st.info("Keine Abfahrten im Zeitfenster.")
     else:
-        all_rows = sorted(all_rows, key=lambda x: (x[0], x[2], x[1]))
-        render_big_table(
+        render_big_table_v2(
             ["Zeit", "Einrichtung", "Zone", "Hinweis / Countdown"],
             all_rows,
-            row_colors=row_colors,
+            row_backgrounds=row_backgrounds,
             text_colors=text_colors,
+            extra_row_css=extra_css,
             html_cols={3},
         )
 
@@ -1390,6 +1552,13 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
     left_zone_name = ZONE_NAME_MAP.get(left_screen_id, left_screen["name"] if left_screen is not None else f"Screen {left_screen_id}")
     right_zone_name = ZONE_NAME_MAP.get(right_screen_id, right_screen["name"] if right_screen is not None else f"Screen {right_screen_id}")
 
+    combined_parts = []
+    if left_data is not None and not left_data.empty:
+        combined_parts.append(left_data)
+    if right_data is not None and not right_data.empty:
+        combined_parts.append(right_data)
+    combined_df = pd.concat(combined_parts, ignore_index=True) if combined_parts else pd.DataFrame()
+
     st.markdown("""
         <style>
         .split-monitor-card {
@@ -1399,12 +1568,6 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
             border: 3px solid #1f2937;
             border-radius: 16px;
             box-shadow: 0 18px 45px rgba(0,0,0,0.28);
-        }
-        .split-divider {
-            min-height: 90vh;
-            width: 1px;
-            background: #d1d5db;
-            border-radius: 1px;
         }
         .split-empty {
             background: #1f2937;
@@ -1427,9 +1590,9 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
         </style>
     """, unsafe_allow_html=True)
 
-    render_display_header(title)
+    render_display_header(title, combined_df)
 
-    col1, colmid, col2 = st.columns([1, 0.0006, 1])
+    col1, col2 = st.columns(2)
 
     with col1:
         st.markdown("<div class='split-monitor-card'>", unsafe_allow_html=True)
@@ -1438,27 +1601,16 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
         if left_data is None or left_data.empty:
             st.markdown("<div class='split-empty'>Keine Abfahrten im Zeitfenster.</div>", unsafe_allow_html=True)
         else:
-            rows, row_colors, text_colors = [], [], []
-            for _, r in left_data.iterrows():
-                info_html = build_info_html(r)
-                rows.append([
-                    ensure_tz(r["datetime"]).strftime("%H:%M"),
-                    r["location_name"],
-                    info_html,
-                ])
-                row_colors.append(r.get("location_color") or "")
-                text_colors.append(r.get("location_text_color") or "")
-            render_big_table(
+            rows, row_backgrounds, text_colors, extra_css = build_display_rows(left_data)
+            render_big_table_v2(
                 ["Zeit", "Einrichtung", "Hinweis / Countdown"],
                 rows,
-                row_colors=row_colors,
+                row_backgrounds=row_backgrounds,
                 text_colors=text_colors,
+                extra_row_css=extra_css,
                 html_cols={2},
             )
         st.markdown("</div>", unsafe_allow_html=True)
-
-    with colmid:
-        st.markdown("<div class='split-divider'></div>", unsafe_allow_html=True)
 
     with col2:
         st.markdown("<div class='split-monitor-card'>", unsafe_allow_html=True)
@@ -1467,21 +1619,13 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
         if right_data is None or right_data.empty:
             st.markdown("<div class='split-empty'>Keine Abfahrten im Zeitfenster.</div>", unsafe_allow_html=True)
         else:
-            rows, row_colors, text_colors = [], [], []
-            for _, r in right_data.iterrows():
-                info_html = build_info_html(r)
-                rows.append([
-                    ensure_tz(r["datetime"]).strftime("%H:%M"),
-                    r["location_name"],
-                    info_html,
-                ])
-                row_colors.append(r.get("location_color") or "")
-                text_colors.append(r.get("location_text_color") or "")
-            render_big_table(
+            rows, row_backgrounds, text_colors, extra_css = build_display_rows(right_data)
+            render_big_table_v2(
                 ["Zeit", "Einrichtung", "Hinweis / Countdown"],
                 rows,
-                row_colors=row_colors,
+                row_backgrounds=row_backgrounds,
                 text_colors=text_colors,
+                extra_row_css=extra_css,
                 html_cols={2},
             )
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1495,9 +1639,138 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
 
 
 # ==================================================
-# ADMIN VIEWS
+# ADMIN ZUSATZ
 # ==================================================
 
+def show_admin_users(can_edit: bool):
+    st.subheader("Benutzer")
+
+    users = get_runtime_users()
+    display_rows = []
+    for uname, data in users.items():
+        pw = str(data.get("password", ""))
+        display_rows.append({
+            "Benutzername": uname,
+            "Rolle": data.get("role", "viewer"),
+            "Passwort gespeichert als": "Hash" if pw.startswith("pbkdf2_sha256$") else "Klartext/Fallback",
+        })
+    st.dataframe(pd.DataFrame(display_rows), use_container_width=True, height=240)
+
+    if not can_edit:
+        st.info("Nur Admin kann Benutzer verwalten.")
+        return
+
+    st.markdown("### Neuer Benutzer")
+    with st.form("new_user_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            new_username = st.text_input("Benutzername")
+        with c2:
+            new_password = st.text_input("Passwort", type="password")
+        with c3:
+            new_role = st.selectbox("Rolle", ["viewer", "admin"])
+        add_user = st.form_submit_button("Benutzer anlegen")
+
+    if add_user:
+        if not new_username.strip():
+            st.error("Benutzername fehlt.")
+        elif not new_password:
+            st.error("Passwort fehlt.")
+        elif new_username in users:
+            st.error("Benutzer existiert bereits.")
+        else:
+            users[new_username.strip()] = {
+                "password": hash_password(new_password),
+                "role": new_role,
+            }
+            save_runtime_users(users)
+            st.success("Benutzer angelegt.")
+            st.rerun()
+
+    if not users:
+        return
+
+    st.markdown("### Benutzer bearbeiten / löschen")
+    selected_user = st.selectbox("Benutzer auswählen", list(users.keys()), key="edit_user_select")
+    selected_data = users[selected_user]
+
+    with st.form("edit_user_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            edit_role = st.selectbox("Rolle", ["viewer", "admin"], index=["viewer", "admin"].index(selected_data.get("role", "viewer")))
+        with c2:
+            edit_password = st.text_input("Neues Passwort (optional)", type="password")
+        csave, cdel = st.columns(2)
+        save_user = csave.form_submit_button("Benutzer speichern")
+        delete_user = cdel.form_submit_button("Benutzer löschen")
+
+    if save_user:
+        users[selected_user]["role"] = edit_role
+        if edit_password:
+            users[selected_user]["password"] = hash_password(edit_password)
+        save_runtime_users(users)
+        st.success("Benutzer gespeichert.")
+        st.rerun()
+
+    if delete_user:
+        current_username = st.session_state.get("username")
+        if selected_user == current_username:
+            st.error("Du kannst den aktuell eingeloggten Benutzer nicht löschen.")
+        else:
+            users.pop(selected_user, None)
+            save_runtime_users(users)
+            st.success("Benutzer gelöscht.")
+            st.rerun()
+
+
+def show_system_status(conn):
+    st.subheader("Systemstatus")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Datenbank OK", "Ja" if integrity_ok(conn) else "Nein")
+        st.caption(str(DB_PATH))
+    with c2:
+        tours_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM tours").iloc[0]["c"])
+        loc_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM locations").iloc[0]["c"])
+        st.metric("Touren", tours_count)
+        st.caption(f"Einrichtungen: {loc_count}")
+    with c3:
+        dep_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM departures").iloc[0]["c"])
+        today_start = datetime.combine(now_berlin().date(), dtime(0, 0)).replace(tzinfo=TZ).isoformat()
+        today_end = (datetime.combine(now_berlin().date(), dtime(23, 59, 59)).replace(tzinfo=TZ)).isoformat()
+        todays_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM departures WHERE datetime BETWEEN ? AND ?", (today_start, today_end)).iloc[0]["c"])
+        st.metric("Abfahrten gesamt", dep_count)
+        st.caption(f"Heute: {todays_count}")
+
+    st.markdown("### Letzte Backups")
+    backups = sorted(BACKUP_DIR.glob("backup_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+    if not backups:
+        st.info("Keine Backups vorhanden.")
+    else:
+        rows = []
+        for p in backups:
+            rows.append({
+                "Datei": p.name,
+                "Zeit": datetime.fromtimestamp(p.stat().st_mtime, TZ).strftime("%d.%m.%Y %H:%M:%S"),
+                "Größe KB": round(p.stat().st_size / 1024, 1),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, height=220)
+
+    st.markdown("### Letzter Log-Eintrag")
+    if APP_LOG_PATH.exists():
+        try:
+            last_line = APP_LOG_PATH.read_text(encoding="utf-8").strip().splitlines()[-1]
+            st.code(last_line, language="json")
+        except Exception:
+            st.info("Logdatei vorhanden, letzter Eintrag konnte nicht gelesen werden.")
+    else:
+        st.info("Noch keine Logdatei vorhanden.")
+
+
+# ==================================================
+# ADMIN VIEWS
+# ==================================================
 
 def show_admin_departures(conn, can_edit: bool):
     st.subheader("Abfahrten")
@@ -1505,13 +1778,38 @@ def show_admin_departures(conn, can_edit: bool):
     update_departure_statuses(conn)
 
     deps = load_departures_with_locations(conn).sort_values("datetime")
-    if deps.empty:
-        st.info("Noch keine Abfahrten vorhanden.")
-    else:
+
+    with st.expander("Filter / Suche", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            search_text = st.text_input("Suche Einrichtung / Hinweis", "")
+        with c2:
+            screen_filter = st.selectbox("Screen", ["ALLE"] + sorted([str(i) for i in deps["screen_id"].dropna().astype(int).unique().tolist()]) if not deps.empty else ["ALLE"])
+        with c3:
+            status_filter = st.selectbox("Status", ["ALLE", "GEPLANT", "BEREIT", "ABGESCHLOSSEN"])
+        with c4:
+            cold_only = st.checkbox("Nur Kühlware", False)
+
+    if not deps.empty:
         view = deps.copy()
+        if search_text.strip():
+            q = search_text.strip().lower()
+            view = view[
+                view["location_name"].fillna("").astype(str).str.lower().str.contains(q)
+                | view["note"].fillna("").astype(str).str.lower().str.contains(q)
+            ]
+        if screen_filter != "ALLE":
+            view = view[view["screen_id"] == int(screen_filter)]
+        if status_filter != "ALLE":
+            view = view[view["status"].fillna("").astype(str).str.upper() == status_filter]
+        if cold_only:
+            view = view[view["cooled_required"] == 1]
+
         view["Quelle"] = view["source_key"].astype(str).apply(lambda s: "TOUR" if s.startswith("TOUR:") else ("MANUELL" if s.startswith("MANUAL:") else "SONST"))
         view["Zeit"] = view["datetime"].apply(lambda d: ensure_tz(d).strftime("%d.%m.%Y %H:%M") if pd.notnull(d) else "")
-        st.dataframe(view[["Zeit", "screen_id", "location_name", "note", "status", "countdown_enabled", "cooled_required", "Quelle"]], use_container_width=True, height=360)
+        st.dataframe(view[["id", "Zeit", "screen_id", "location_name", "note", "status", "countdown_enabled", "cooled_required", "Quelle"]], use_container_width=True, height=360)
+    else:
+        st.info("Noch keine Abfahrten vorhanden.")
 
     if not can_edit:
         return
@@ -1555,25 +1853,81 @@ def show_admin_departures(conn, can_edit: bool):
             st.success("Gespeichert.")
             st.rerun()
 
-    st.markdown("### Manuelle Abfahrt löschen")
+    st.markdown("### Manuelle Abfahrt bearbeiten / löschen")
     manual = deps[deps["source_key"].astype(str).str.startswith("MANUAL:")].copy() if not deps.empty else pd.DataFrame()
     if manual.empty:
         st.info("Keine manuellen Abfahrten vorhanden.")
     else:
-        manual["label"] = manual.apply(lambda r: f"ID {int(r['id'])} • {ensure_tz(r['datetime']).strftime('%d.%m.%Y %H:%M')} • Screen {r['screen_id']} • {r['location_name']}", axis=1)
-        selected_label = st.selectbox("Manuelle Abfahrt auswählen", manual["label"].tolist(), key="delete_manual_dep_select")
-        selected_id = int(manual.loc[manual["label"] == selected_label, "id"].iloc[0])
-        if st.button("Ausgewählte manuelle Abfahrt löschen"):
+        manual["label"] = manual.apply(
+            lambda r: f"ID {int(r['id'])} • {ensure_tz(r['datetime']).strftime('%d.%m.%Y %H:%M')} • Screen {r['screen_id']} • {r['location_name']}",
+            axis=1
+        )
+        selected_label = st.selectbox("Manuelle Abfahrt auswählen", manual["label"].tolist(), key="edit_delete_manual_dep_select")
+        row = manual.loc[manual["label"] == selected_label].iloc[0]
+        dep_id = int(row["id"])
+
+        with st.form("edit_manual_departure_form"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                edit_loc_id = st.selectbox(
+                    "Einrichtung",
+                    locations["id"].tolist(),
+                    index=locations["id"].tolist().index(int(row["location_id"])),
+                    format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0],
+                    key="edit_manual_loc",
+                )
+                edit_note = st.text_input("Hinweis", value=str(row.get("note") or ""))
+            with c2:
+                edit_date = st.date_input("Datum", value=ensure_tz(row["datetime"]).date(), key="edit_manual_date")
+                current_time = ensure_tz(row["datetime"]).strftime("%H:%M")
+                options = time_options_half_hour()
+                if current_time not in options:
+                    current_time = "08:00"
+                edit_time = st.selectbox("Uhrzeit", options, index=options.index(current_time), key="edit_manual_time")
+            with c3:
+                screen_options = screens["id"].tolist()
+                current_screen = int(row["screen_id"])
+                edit_screen_id = st.selectbox("Screen", screen_options, index=screen_options.index(current_screen), key="edit_manual_screen")
+                edit_countdown = st.checkbox("Countdown aktiv", value=bool(int(row.get("countdown_enabled", 1))), key="edit_manual_countdown")
+                edit_cooled = st.checkbox("Kühlware mitzunehmen", value=bool(int(row.get("cooled_required", 0))), key="edit_manual_cooled")
+
+            csave, cdel = st.columns(2)
+            save_manual = csave.form_submit_button("Manuelle Abfahrt speichern")
+            delete_manual = cdel.form_submit_button("Manuelle Abfahrt löschen")
+
+        if save_manual:
+            hh, mm = map(int, edit_time.split(":"))
+            dep_dt = datetime.combine(edit_date, dtime(hour=hh, minute=mm)).replace(tzinfo=TZ)
             try:
-                conn.execute("DELETE FROM departures WHERE id=? AND source_key LIKE 'MANUAL:%'", (selected_id,))
+                update_manual_departure(
+                    conn,
+                    dep_id,
+                    dep_dt,
+                    int(edit_loc_id),
+                    int(edit_screen_id),
+                    edit_note,
+                    edit_countdown,
+                    edit_cooled,
+                )
+                save_backup_to_dir(conn)
+                cleanup_old_backups()
+                st.success("Manuelle Abfahrt aktualisiert.")
+                st.rerun()
+            except Exception as e:
+                log_event(conn, "error", "manual_departure", entity_id=dep_id, details={"message": str(e)}, level="ERROR")
+                st.error(f"Speichern fehlgeschlagen: {e}")
+
+        if delete_manual:
+            try:
+                conn.execute("DELETE FROM departures WHERE id=? AND source_key LIKE 'MANUAL:%'", (dep_id,))
                 conn.commit()
-                log_event(conn, "delete", "manual_departure", entity_id=selected_id)
+                log_event(conn, "delete", "manual_departure", entity_id=dep_id)
                 save_backup_to_dir(conn)
                 cleanup_old_backups()
                 st.success("Manuelle Abfahrt gelöscht.")
                 st.rerun()
             except Exception as e:
-                log_event(conn, "error", "manual_departure", entity_id=selected_id, details={"message": str(e)}, level="ERROR")
+                log_event(conn, "error", "manual_departure", entity_id=dep_id, details={"message": str(e)}, level="ERROR")
                 st.error(f"Löschen fehlgeschlagen: {e}")
 
 
@@ -1671,6 +2025,18 @@ def show_admin_locations(conn, can_edit: bool):
 
 def show_admin_tours(conn, can_edit: bool):
     st.subheader("Touren")
+
+    tours = load_tours(conn)
+
+    with st.expander("Filter / Suche", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            search_text = st.text_input("Suche Tour / Hinweis", key="tour_filter_search")
+        with c2:
+            weekday_filter = st.selectbox("Wochentag", ["ALLE"] + WEEKDAYS_DE, key="tour_filter_weekday")
+        with c3:
+            cold_only = st.checkbox("Nur Kühlware", False, key="tour_filter_cold")
+
     tours_csv, tour_stops_csv = export_tours_csv(conn)
     c1, c2 = st.columns(2)
     with c1:
@@ -1678,9 +2044,19 @@ def show_admin_tours(conn, can_edit: bool):
     with c2:
         st.download_button("Tour-Stopps als CSV", data=tour_stops_csv, file_name="tour_stops.csv", mime="text/csv")
 
-    tours = load_tours(conn)
     if not tours.empty:
         view = tours.copy()
+        if search_text.strip():
+            q = search_text.strip().lower()
+            view = view[
+                view["name"].fillna("").astype(str).str.lower().str.contains(q)
+                | view["note"].fillna("").astype(str).str.lower().str.contains(q)
+            ]
+        if weekday_filter != "ALLE":
+            view = view[view["weekday"] == weekday_filter]
+        if cold_only:
+            view = view[view["cooled_required"] == 1]
+
         view["Zeit"] = view.apply(lambda r: f"{int(r['hour']):02d}:{int(r['minute']):02d}", axis=1)
         st.dataframe(view[["id", "name", "weekday", "Zeit", "countdown_enabled", "cooled_required", "location_name", "note", "active", "screen_ids"]], use_container_width=True, height=300)
     else:
@@ -1946,6 +2322,130 @@ def show_admin_screens(conn, can_edit: bool):
             st.error(f"Screen speichern fehlgeschlagen: {e}")
 
 
+def show_admin_users(can_edit: bool):
+    st.subheader("Benutzer")
+
+    users = get_runtime_users()
+    rows = []
+    for uname, data in users.items():
+        pw = str(data.get("password", ""))
+        rows.append({
+            "Benutzername": uname,
+            "Rolle": data.get("role", "viewer"),
+            "Passwort gespeichert als": "Hash" if pw.startswith("pbkdf2_sha256$") else "Klartext/Fallback",
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, height=220)
+
+    if not can_edit:
+        st.info("Nur Admin kann Benutzer verwalten.")
+        return
+
+    st.markdown("### Neuer Benutzer")
+    with st.form("new_user_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            new_username = st.text_input("Benutzername")
+        with c2:
+            new_password = st.text_input("Passwort", type="password")
+        with c3:
+            new_role = st.selectbox("Rolle", ["viewer", "admin"])
+        add_user = st.form_submit_button("Benutzer anlegen")
+
+    if add_user:
+        if not new_username.strip():
+            st.error("Benutzername fehlt.")
+        elif not new_password:
+            st.error("Passwort fehlt.")
+        elif new_username in users:
+            st.error("Benutzer existiert bereits.")
+        else:
+            users[new_username.strip()] = {
+                "password": hash_password(new_password),
+                "role": new_role,
+            }
+            save_runtime_users(users)
+            st.success("Benutzer angelegt.")
+            st.rerun()
+
+    if users:
+        st.markdown("### Benutzer bearbeiten / löschen")
+        selected_user = st.selectbox("Benutzer auswählen", list(users.keys()), key="edit_user_select")
+        selected_data = users[selected_user]
+
+        with st.form("edit_user_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                edit_role = st.selectbox("Rolle", ["viewer", "admin"], index=["viewer", "admin"].index(selected_data.get("role", "viewer")))
+            with c2:
+                edit_password = st.text_input("Neues Passwort (optional)", type="password")
+            csave, cdel = st.columns(2)
+            save_user = csave.form_submit_button("Benutzer speichern")
+            delete_user = cdel.form_submit_button("Benutzer löschen")
+
+        if save_user:
+            users[selected_user]["role"] = edit_role
+            if edit_password:
+                users[selected_user]["password"] = hash_password(edit_password)
+            save_runtime_users(users)
+            st.success("Benutzer gespeichert.")
+            st.rerun()
+
+        if delete_user:
+            current_username = st.session_state.get("username")
+            if selected_user == current_username:
+                st.error("Du kannst den aktuell eingeloggten Benutzer nicht löschen.")
+            else:
+                users.pop(selected_user, None)
+                save_runtime_users(users)
+                st.success("Benutzer gelöscht.")
+                st.rerun()
+
+
+def show_system_status(conn):
+    st.subheader("Systemstatus")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Datenbank OK", "Ja" if integrity_ok(conn) else "Nein")
+        st.caption(str(DB_PATH))
+    with c2:
+        tours_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM tours").iloc[0]["c"])
+        loc_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM locations").iloc[0]["c"])
+        st.metric("Touren", tours_count)
+        st.caption(f"Einrichtungen: {loc_count}")
+    with c3:
+        dep_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM departures").iloc[0]["c"])
+        today_start = datetime.combine(now_berlin().date(), dtime(0, 0)).replace(tzinfo=TZ).isoformat()
+        today_end = datetime.combine(now_berlin().date(), dtime(23, 59, 59)).replace(tzinfo=TZ).isoformat()
+        todays_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM departures WHERE datetime BETWEEN ? AND ?", (today_start, today_end)).iloc[0]["c"])
+        st.metric("Abfahrten gesamt", dep_count)
+        st.caption(f"Heute: {todays_count}")
+
+    st.markdown("### Letzte Backups")
+    backups = sorted(BACKUP_DIR.glob("backup_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+    if not backups:
+        st.info("Keine Backups vorhanden.")
+    else:
+        rows = []
+        for p in backups:
+            rows.append({
+                "Datei": p.name,
+                "Zeit": datetime.fromtimestamp(p.stat().st_mtime, TZ).strftime("%d.%m.%Y %H:%M:%S"),
+                "Größe KB": round(p.stat().st_size / 1024, 1),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, height=220)
+
+    st.markdown("### Letzter Log-Eintrag")
+    if APP_LOG_PATH.exists():
+        try:
+            last_line = APP_LOG_PATH.read_text(encoding="utf-8").strip().splitlines()[-1]
+            st.code(last_line, language="json")
+        except Exception:
+            st.info("Logdatei vorhanden, letzter Eintrag konnte nicht gelesen werden.")
+    else:
+        st.info("Noch keine Logdatei vorhanden.")
+
+
 def show_admin_mode():
     require_login()
     conn = get_connection()
@@ -1972,27 +2472,26 @@ def show_admin_mode():
         "Touren",
         "Kühlware",
         "Screens / Ticker",
+        "Benutzer",
         "Wartung",
         "Backup",
         "Änderungsprotokoll",
+        "Systemstatus",
     ])
 
     with tabs[0]:
         show_admin_departures(conn, can_edit)
-
     with tabs[1]:
         show_admin_locations(conn, can_edit)
-
     with tabs[2]:
         show_admin_tours(conn, can_edit)
-
     with tabs[3]:
         show_admin_cold_goods(conn, can_edit)
-
     with tabs[4]:
         show_admin_screens(conn, can_edit)
-
     with tabs[5]:
+        show_admin_users(can_edit)
+    with tabs[6]:
         st.subheader("Wartung")
         c1, c2, c3 = st.columns(3)
 
@@ -2026,7 +2525,7 @@ def show_admin_mode():
                     log_event(conn, "error", "backup", details={"message": str(e)}, level="ERROR")
                     st.error(f"Backup fehlgeschlagen: {e}")
 
-    with tabs[6]:
+    with tabs[7]:
         st.subheader("Backup")
         c1, c2 = st.columns(2)
 
@@ -2054,91 +2553,115 @@ def show_admin_mode():
                     log_event(conn, "error", "backup_import", details={"message": str(e)}, level="ERROR")
                     st.error(f"Backup-Import fehlgeschlagen: {e}")
 
-    with tabs[7]:
+    with tabs[8]:
         st.subheader("Änderungsprotokoll")
-        audit_df = read_df(
-            conn,
-            "SELECT event_time, username, event_type, entity_type, entity_id, details_json FROM audit_log ORDER BY id DESC LIMIT 200"
-        )
+        audit_df = read_df(conn, "SELECT event_time, username, event_type, entity_type, entity_id, details_json FROM audit_log ORDER BY id DESC LIMIT 300")
         if audit_df.empty:
             st.info("Noch keine Protokolleinträge vorhanden.")
         else:
-            st.dataframe(audit_df, use_container_width=True, height=500)
+            st.dataframe(audit_df, use_container_width=True, height=520)
+
+    with tabs[9]:
+        show_system_status(conn)
 
 
 # ==================================================
 # DISPLAY MODE
 # ==================================================
 
+def show_display_error(message: str):
+    st.markdown(
+        f"""
+        <div style="
+            display:flex;
+            justify-content:center;
+            align-items:center;
+            height:100vh;
+            width:100%;
+            background:#000;
+            color:#fff;
+            font-size:42px;
+            font-weight:900;
+            text-align:center;
+            padding:40px;
+        ">
+            SYSTEMFEHLER – {escape_html(message)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 def show_display_mode(screen_id: int):
     st.markdown(base_display_css(), unsafe_allow_html=True)
 
     if not screen_id:
-        st.error("Parameter 'screenId' fehlt oder ist ungültig.")
+        show_display_error("ScreenId fehlt oder ist ungültig")
         return
 
-    conn = get_connection()
-    materialize_tours_to_departures(conn)
-    update_departure_statuses(conn)
-    screens = load_screens(conn)
+    try:
+        conn = get_connection()
+        materialize_tours_to_departures(conn)
+        update_departure_statuses(conn)
+        screens = load_screens(conn)
 
-    if int(screen_id) in COMBINED_SCREEN_MAP:
-        cfg = COMBINED_SCREEN_MAP[int(screen_id)]
-        st_autorefresh(interval=15000, key=f"display_refresh_combined_{screen_id}")
-        render_split_screen(conn, cfg["left"], cfg["right"], cfg["name"])
-        return
+        if int(screen_id) in COMBINED_SCREEN_MAP:
+            cfg = COMBINED_SCREEN_MAP[int(screen_id)]
+            st_autorefresh(interval=15000, key=f"display_refresh_combined_{screen_id}")
+            render_split_screen(conn, cfg["left"], cfg["right"], cfg["name"])
+            return
 
-    if int(screen_id) in [5, 6, 7]:
-        st_autorefresh(interval=15000, key=f"display_refresh_zone_overview_{screen_id}")
-        render_zone_overview_screen(conn, int(screen_id))
-        return
+        if int(screen_id) in [5, 6, 7]:
+            st_autorefresh(interval=15000, key=f"display_refresh_zone_overview_{screen_id}")
+            render_zone_overview_screen(conn, int(screen_id))
+            return
 
-    if screens.empty or int(screen_id) not in screens["id"].tolist():
-        st.error(f"Screen {screen_id} ist nicht konfiguriert.")
-        return
+        if screens.empty or int(screen_id) not in screens["id"].tolist():
+            show_display_error(f"Screen {screen_id} ist nicht konfiguriert")
+            return
 
-    screen = screens.loc[screens["id"] == int(screen_id)].iloc[0]
-    st_autorefresh(interval=int(screen["refresh_interval_seconds"]) * 1000, key=f"display_refresh_{screen_id}")
+        screen = screens.loc[screens["id"] == int(screen_id)].iloc[0]
+        st_autorefresh(interval=int(screen["refresh_interval_seconds"]) * 1000, key=f"display_refresh_{screen_id}")
 
-    if bool(screen["holiday_flag"]) or bool(screen["special_flag"]):
-        labels = []
-        if bool(screen["holiday_flag"]):
-            labels.append("Feiertagsbelieferung")
-        if bool(screen["special_flag"]):
-            labels.append("Sonderplan")
-        st.markdown(
-            f"<div style='display:flex;justify-content:center;align-items:center;height:100vh;background:#000;color:#fff;font-size:72px;font-weight:900;text-transform:uppercase;text-align:center;'>{' - '.join(labels)}</div>",
-            unsafe_allow_html=True
-        )
-        return
+        if bool(screen["holiday_flag"]) or bool(screen["special_flag"]):
+            labels = []
+            if bool(screen["holiday_flag"]):
+                labels.append("Feiertagsbelieferung")
+            if bool(screen["special_flag"]):
+                labels.append("Sonderplan")
+            st.markdown(
+                f"<div style='display:flex;justify-content:center;align-items:center;height:100vh;background:#000;color:#fff;font-size:72px;font-weight:900;text-transform:uppercase;text-align:center;'>{' - '.join(labels)}</div>",
+                unsafe_allow_html=True
+            )
+            return
 
-    render_display_header(f"{screen['name']} (Screen {screen_id})")
+        _, data = get_screen_data(conn, int(screen_id))
+        render_display_header(f"{screen['name']} (Screen {screen_id})", data)
 
-    _, data = get_screen_data(conn, int(screen_id))
-    if data.empty:
-        st.info("Keine Abfahrten im nächsten Zeitfenster.")
-    else:
-        rows, row_colors, text_colors = [], [], []
-        for _, r in data.iterrows():
-            info_html = build_info_html(r)
-            rows.append([
-                ensure_tz(r["datetime"]).strftime("%H:%M"),
-                r["location_name"],
-                info_html,
-            ])
-            row_colors.append(r.get("location_color") or "")
-            text_colors.append(r.get("location_text_color") or "")
-        render_big_table(["Zeit", "Einrichtung", "Hinweis / Countdown"], rows, row_colors=row_colors, text_colors=text_colors, html_cols={2})
+        if data.empty:
+            st.info("Keine Abfahrten im nächsten Zeitfenster.")
+        else:
+            rows, row_backgrounds, text_colors, extra_css = build_display_rows(data)
+            render_big_table_v2(
+                ["Zeit", "Einrichtung", "Hinweis / Countdown"],
+                rows,
+                row_backgrounds=row_backgrounds,
+                text_colors=text_colors,
+                extra_row_css=extra_css,
+                html_cols={2},
+            )
 
-    if bool(screen.get("ticker_active", 0)) and str(screen.get("text", "") or "").strip():
-        st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(screen['text'])}</div></div>", unsafe_allow_html=True)
+        if bool(screen.get("ticker_active", 0)) and str(screen.get("text", "") or "").strip():
+            st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(screen['text'])}</div></div>", unsafe_allow_html=True)
+
+    except Exception as e:
+        log_event(None, "error", "display_mode", details={"message": str(e), "screen_id": screen_id}, level="ERROR")
+        show_display_error(str(e))
 
 
 # ==================================================
 # MAIN
 # ==================================================
-
 
 def main():
     params = st.query_params
