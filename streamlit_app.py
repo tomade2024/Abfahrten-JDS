@@ -147,100 +147,6 @@ FORCE_DAILY_BACKUP_HOURS = int(APP_CONFIG["backup"]["force_daily_if_older_than_h
 OVERVIEW_GROUPS = {int(k): v for k, v in APP_CONFIG.get("overview_groups", {}).items()}
 
 # ==================================================
-# LOGIN / LOGGING
-# ==================================================
-
-
-def log_event(conn: sqlite3.Connection | None, event_type: str, entity_type: str, entity_id=None, details: dict | None = None, level: str = "INFO"):
-    ts = now_berlin().isoformat(timespec="seconds")
-    username = str(st.session_state.get("username") or "SYSTEM")
-    payload = {
-        "ts": ts,
-        "level": level,
-        "event_type": event_type,
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "username": username,
-        "details": details or {},
-    }
-    try:
-        with open(APP_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    if conn is not None:
-        try:
-            conn.execute(
-                """
-                INSERT INTO audit_log (event_time, username, event_type, entity_type, entity_id, details_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (ts, username, event_type, entity_type, None if entity_id is None else str(entity_id), json.dumps(details or {}, ensure_ascii=False)),
-            )
-            conn.commit()
-        except Exception:
-            pass
-
-
-def run_safe(label: str, func, *args, **kwargs):
-    try:
-        return True, func(*args, **kwargs)
-    except Exception as e:
-        log_event(None, "error", label, details={"message": str(e)}, level="ERROR")
-        st.error(f"{label}: {e}")
-        return False, None
-
-
-def get_users():
-    try:
-        secrets_users = st.secrets.get("users", None)
-        if secrets_users:
-            out = {}
-            for username, data in secrets_users.items():
-                out[str(username)] = {
-                    "password": str(data.get("password", "")),
-                    "role": str(data.get("role", "viewer")),
-                }
-            if out:
-                return out
-    except Exception:
-        pass
-    if REQUIRE_SECRETS_IN_PRODUCTION and not ALLOW_DEFAULT_USERS:
-        return {}
-    return DEFAULT_USERS if ALLOW_DEFAULT_USERS else {}
-
-
-def require_login():
-    if st.session_state.get("logged_in"):
-        return
-
-    st.title("Login")
-    users = get_users()
-    if not users:
-        st.error("Keine Benutzer konfiguriert. Bitte users in secrets oder config.json hinterlegen.")
-        st.stop()
-
-    with st.form("login_form"):
-        username = st.text_input("Benutzername")
-        password = st.text_input("Passwort", type="password")
-        submitted = st.form_submit_button("Einloggen")
-
-    if submitted:
-        user_entry = users.get(username)
-        if user_entry and user_entry["password"] == password:
-            st.session_state["logged_in"] = True
-            st.session_state["role"] = user_entry["role"]
-            st.session_state["username"] = username
-            st.success("Erfolgreich eingeloggt.")
-            log_event(None, "login", "auth", details={"username": username})
-            st.rerun()
-        else:
-            st.error("Benutzername oder Passwort ist falsch.")
-            log_event(None, "login_failed", "auth", details={"username": username}, level="WARNING")
-
-    st.stop()
-
-# ==================================================
 # ZEIT / HELPERS
 # ==================================================
 
@@ -299,6 +205,103 @@ def escape_html(text: str) -> str:
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ==================================================
+# LOGIN / LOGGING
+# ==================================================
+
+
+def log_event(conn: sqlite3.Connection | None, event_type: str, entity_type: str, entity_id=None, details: dict | None = None, level: str = "INFO"):
+    ts = now_berlin().isoformat(timespec="seconds")
+    username = str(st.session_state.get("username") or "SYSTEM")
+    payload = {
+        "ts": ts,
+        "level": level,
+        "event_type": event_type,
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "username": username,
+        "details": details or {},
+    }
+    try:
+        with open(APP_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+    if conn is not None:
+        try:
+            conn.execute(
+                """
+                INSERT INTO audit_log (event_time, username, event_type, entity_type, entity_id, details_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (ts, username, event_type, entity_type, None if entity_id is None else str(entity_id), json.dumps(details or {}, ensure_ascii=False)),
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+
+def run_safe(label: str, func, *args, **kwargs):
+    try:
+        return True, func(*args, **kwargs)
+    except Exception as e:
+        log_event(None, "error", label, details={"message": str(e)}, level="ERROR")
+        st.error(f"{label}: {e}")
+        return False, None
+
+
+def get_users():
+    try:
+        secrets_users = st.secrets.get("users", None)
+        if secrets_users:
+            out = {}
+            for username, data in secrets_users.items():
+                out[str(username)] = {
+                    "password": str(data.get("password", "")),
+                    "role": str(data.get("role", "viewer")),
+                }
+            if out:
+                return out
+    except Exception:
+        pass
+
+    if REQUIRE_SECRETS_IN_PRODUCTION and not ALLOW_DEFAULT_USERS:
+        return {}
+
+    return DEFAULT_USERS if ALLOW_DEFAULT_USERS else {}
+
+
+def require_login():
+    if st.session_state.get("logged_in"):
+        return
+
+    st.title("Login")
+    users = get_users()
+    if not users:
+        st.error("Keine Benutzer konfiguriert. Bitte users in secrets oder config.json hinterlegen.")
+        st.stop()
+
+    with st.form("login_form"):
+        username = st.text_input("Benutzername")
+        password = st.text_input("Passwort", type="password")
+        submitted = st.form_submit_button("Einloggen")
+
+    if submitted:
+        user_entry = users.get(username)
+        if user_entry and user_entry["password"] == password:
+            st.session_state["logged_in"] = True
+            st.session_state["role"] = user_entry["role"]
+            st.session_state["username"] = username
+            st.success("Erfolgreich eingeloggt.")
+            log_event(None, "login", "auth", details={"username": username})
+            st.rerun()
+        else:
+            st.error("Benutzername oder Passwort ist falsch.")
+            log_event(None, "login_failed", "auth", details={"username": username}, level="WARNING")
+
+    st.stop()
+
+# ==================================================
 # DATENBANK
 # ==================================================
 
@@ -352,6 +355,7 @@ def init_db(conn: sqlite3.Connection):
             created_by TEXT,
             screen_id INTEGER,
             countdown_enabled INTEGER NOT NULL DEFAULT 1,
+            cooled_required INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(location_id) REFERENCES locations(id)
         )
     """)
@@ -368,6 +372,7 @@ def init_db(conn: sqlite3.Connection):
             active INTEGER NOT NULL DEFAULT 1,
             screen_ids TEXT,
             countdown_enabled INTEGER NOT NULL DEFAULT 0,
+            cooled_required INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(location_id) REFERENCES locations(id)
         )
     """)
@@ -470,6 +475,8 @@ def migrate_db(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE departures ADD COLUMN completed_at TEXT")
     if "countdown_enabled" not in deps:
         cur.execute("ALTER TABLE departures ADD COLUMN countdown_enabled INTEGER NOT NULL DEFAULT 1")
+    if "cooled_required" not in deps:
+        cur.execute("ALTER TABLE departures ADD COLUMN cooled_required INTEGER NOT NULL DEFAULT 0")
 
     locs = table_cols("locations")
     if "color" not in locs:
@@ -484,6 +491,8 @@ def migrate_db(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE tours ADD COLUMN screen_ids TEXT")
     if "countdown_enabled" not in tours:
         cur.execute("ALTER TABLE tours ADD COLUMN countdown_enabled INTEGER NOT NULL DEFAULT 0")
+    if "cooled_required" not in tours:
+        cur.execute("ALTER TABLE tours ADD COLUMN cooled_required INTEGER NOT NULL DEFAULT 0")
 
     conn.commit()
 
@@ -522,7 +531,7 @@ def load_screens(conn):
 def load_tours(conn):
     return read_df(conn, """
         SELECT t.id, t.name, t.weekday, t.hour, t.minute, t.location_id,
-               t.note, t.active, t.screen_ids, t.countdown_enabled,
+               t.note, t.active, t.screen_ids, t.countdown_enabled, t.cooled_required,
                l.name AS location_name
         FROM tours t
         JOIN locations l ON t.location_id = l.id
@@ -555,6 +564,7 @@ def load_departures_with_locations(conn):
                    d.created_by AS created_by,
                    d.screen_id AS screen_id,
                    d.countdown_enabled AS countdown_enabled,
+                   d.cooled_required AS cooled_required,
                    l.name AS location_name,
                    l.type AS location_type,
                    l.active AS location_active,
@@ -579,6 +589,7 @@ def load_departures_with_locations(conn):
         "created_by": "",
         "screen_id": None,
         "countdown_enabled": 1,
+        "cooled_required": 0,
         "location_name": "",
         "location_type": "",
         "location_active": 1,
@@ -595,9 +606,8 @@ def load_departures_with_locations(conn):
             df[col] = pd.to_datetime(df[col], errors="coerce")
             df[col] = df[col].apply(lambda x: ensure_tz(x) if pd.notnull(x) else x)
 
-        df["countdown_enabled"] = pd.to_numeric(
-            df["countdown_enabled"], errors="coerce"
-        ).fillna(1).astype(int)
+        df["countdown_enabled"] = pd.to_numeric(df["countdown_enabled"], errors="coerce").fillna(1).astype(int)
+        df["cooled_required"] = pd.to_numeric(df["cooled_required"], errors="coerce").fillna(0).astype(int)
 
     return df
 
@@ -621,7 +631,7 @@ def export_tours_csv(conn) -> tuple[bytes, bytes]:
     if tours.empty:
         return df_to_csv_bytes(pd.DataFrame()), df_to_csv_bytes(pd.DataFrame())
 
-    tours_df = tours[["id", "name", "weekday", "hour", "minute", "note", "active", "screen_ids", "countdown_enabled", "location_id", "location_name"]].copy()
+    tours_df = tours[["id", "name", "weekday", "hour", "minute", "note", "active", "screen_ids", "countdown_enabled", "cooled_required", "location_id", "location_name"]].copy()
     stop_rows = []
     for _, t in tours.iterrows():
         stops = load_tour_stops(conn, int(t["id"]))
@@ -652,6 +662,7 @@ def export_backup_json(conn) -> bytes:
             "active": int(t["active"]),
             "screen_ids": str(t["screen_ids"] or ""),
             "countdown_enabled": int(t["countdown_enabled"] or 0),
+            "cooled_required": int(t["cooled_required"] or 0),
             "stops": stops_df.to_dict(orient="records"),
         })
     payload = {
@@ -700,10 +711,8 @@ def maybe_run_nightly_backup(conn):
             pass
         return
 
-    latest = None
     files = sorted(BACKUP_DIR.glob("backup_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if files:
-        latest = files[0]
+    latest = files[0] if files else None
     if latest is not None:
         age_hours = (time.time() - latest.stat().st_mtime) / 3600.0
         if age_hours >= FORCE_DAILY_BACKUP_HOURS:
@@ -713,6 +722,7 @@ def maybe_run_nightly_backup(conn):
 
 def import_backup_json(conn, data: dict):
     cur = conn.cursor()
+
     for loc in data.get("locations", []):
         if not loc.get("name") or not loc.get("type"):
             continue
@@ -744,17 +754,42 @@ def import_backup_json(conn, data: dict):
             exists = cur.fetchone()[0] > 0
             if exists:
                 cur.execute(
-                    "UPDATE tours SET name=?, weekday=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=? WHERE id=?",
-                    (t["name"], t["weekday"], int(t.get("hour", 0)), int(t.get("minute", 0)), int(t["location_id"]), t.get("note", ""), int(t.get("active", 1)), t.get("screen_ids", ""), int(t.get("countdown_enabled", 0)), int(tour_id)),
+                    "UPDATE tours SET name=?, weekday=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=?, cooled_required=? WHERE id=?",
+                    (
+                        t["name"],
+                        t["weekday"],
+                        int(t.get("hour", 0)),
+                        int(t.get("minute", 0)),
+                        int(t["location_id"]),
+                        t.get("note", ""),
+                        int(t.get("active", 1)),
+                        t.get("screen_ids", ""),
+                        int(t.get("countdown_enabled", 0)),
+                        int(t.get("cooled_required", 0)),
+                        int(tour_id),
+                    ),
                 )
             else:
                 cur.execute(
-                    "INSERT INTO tours (id, name, weekday, hour, minute, location_id, note, active, screen_ids, countdown_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (int(tour_id), t["name"], t["weekday"], int(t.get("hour", 0)), int(t.get("minute", 0)), int(t["location_id"]), t.get("note", ""), int(t.get("active", 1)), t.get("screen_ids", ""), int(t.get("countdown_enabled", 0))),
+                    "INSERT INTO tours (id, name, weekday, hour, minute, location_id, note, active, screen_ids, countdown_enabled, cooled_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(tour_id),
+                        t["name"],
+                        t["weekday"],
+                        int(t.get("hour", 0)),
+                        int(t.get("minute", 0)),
+                        int(t["location_id"]),
+                        t.get("note", ""),
+                        int(t.get("active", 1)),
+                        t.get("screen_ids", ""),
+                        int(t.get("countdown_enabled", 0)),
+                        int(t.get("cooled_required", 0)),
+                    ),
                 )
             cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(tour_id),))
             for s in t.get("stops", []):
                 cur.execute("INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)", (int(tour_id), int(s["location_id"]), int(s.get("position", 0))))
+
     conn.commit()
 
 # ==================================================
@@ -768,11 +803,14 @@ def update_departure_statuses(conn: sqlite3.Connection):
     df = read_df(conn, "SELECT id, datetime, status FROM departures")
     if df.empty:
         return
+
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df = df.dropna(subset=["datetime"])
     df["datetime"] = df["datetime"].apply(ensure_tz)
+
     to_ready = []
     to_done = []
+
     for _, r in df.iterrows():
         dep_dt = ensure_tz(r["datetime"])
         status = str(r["status"] or "").upper()
@@ -782,10 +820,12 @@ def update_departure_statuses(conn: sqlite3.Connection):
             to_done.append(int(r["id"]))
         elif now >= dep_dt and status != "BEREIT":
             to_ready.append(int(r["id"]))
+
     if to_ready:
         conn.executemany("UPDATE departures SET status='BEREIT', ready_at=COALESCE(ready_at, ?) WHERE id=?", [(now_iso, i) for i in to_ready])
     if to_done:
         conn.executemany("UPDATE departures SET status='ABGESCHLOSSEN', completed_at=COALESCE(completed_at, ?) WHERE id=?", [(now_iso, i) for i in to_done])
+
     if to_ready or to_done:
         conn.commit()
 
@@ -800,12 +840,14 @@ def cleanup_materialized_departures(conn: sqlite3.Connection):
 
 def materialize_tours_to_departures(conn: sqlite3.Connection):
     cleanup_materialized_departures(conn)
+
     now = now_berlin()
     window = timedelta(hours=MATERIALIZE_TOURS_HOURS_BEFORE)
     df = read_df(conn, """
         SELECT t.id AS tour_id, t.weekday, t.hour, t.minute, t.note AS tour_note,
                t.active AS tour_active, t.screen_ids AS tour_screen_ids,
                t.countdown_enabled AS tour_countdown_enabled,
+               t.cooled_required AS tour_cooled_required,
                ts.location_id, ts.position, l.active AS location_active
         FROM tours t
         JOIN tour_stops ts ON ts.tour_id = t.id
@@ -813,9 +855,11 @@ def materialize_tours_to_departures(conn: sqlite3.Connection):
     """)
     if df.empty:
         return
+
     df = df[(df["tour_active"] == 1) & (df["location_active"] == 1)]
     cur = conn.cursor()
     created_any = False
+
     for _, r in df.iterrows():
         weekday = str(r["weekday"])
         if weekday not in WEEKDAYS_DE:
@@ -830,20 +874,33 @@ def materialize_tours_to_departures(conn: sqlite3.Connection):
             source_key = f"TOUR:{int(r['tour_id'])}:{int(r['position'])}:{sid}:{dep_dt.isoformat()}"
             try:
                 execute_with_retry(cur, """
-                    INSERT INTO departures (datetime, location_id, vehicle, status, note, source_key, created_by, screen_id, countdown_enabled)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (dep_dt.isoformat(), int(r["location_id"]), "", "GEPLANT", str(r["tour_note"] or ""), source_key, "TOUR_AUTO", sid, int(r["tour_countdown_enabled"] or 0)))
+                    INSERT INTO departures (datetime, location_id, vehicle, status, note, source_key, created_by, screen_id, countdown_enabled, cooled_required)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    dep_dt.isoformat(),
+                    int(r["location_id"]),
+                    "",
+                    "GEPLANT",
+                    str(r["tour_note"] or ""),
+                    source_key,
+                    "TOUR_AUTO",
+                    sid,
+                    int(r["tour_countdown_enabled"] or 0),
+                    int(r["tour_cooled_required"] or 0),
+                ))
                 created_any = True
             except sqlite3.IntegrityError:
                 pass
+
     if created_any:
         conn.commit()
 
 
-def create_manual_departures(conn, dep_dt: datetime, location_id: int, screen_ids: list[int], note: str, created_by: str, countdown_enabled: bool):
+def create_manual_departures(conn, dep_dt: datetime, location_id: int, screen_ids: list[int], note: str, created_by: str, countdown_enabled: bool, cooled_required: bool):
     cur = conn.cursor()
     note_clean = (note or "").strip()
     created = 0
+
     for sid in screen_ids:
         dup = read_df(
             conn,
@@ -857,14 +914,34 @@ def create_manual_departures(conn, dep_dt: datetime, location_id: int, screen_id
         )
         if not dup.empty and int(dup.iloc[0]["c"]) > 0:
             continue
+
         source_key = f"MANUAL:{uuid.uuid4().hex}:{sid}:{dep_dt.isoformat()}"
         execute_with_retry(cur, """
-            INSERT INTO departures (datetime, location_id, vehicle, status, note, source_key, created_by, screen_id, countdown_enabled)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (dep_dt.isoformat(), int(location_id), "", "GEPLANT", note_clean, source_key, created_by, int(sid), 1 if countdown_enabled else 0))
+            INSERT INTO departures (datetime, location_id, vehicle, status, note, source_key, created_by, screen_id, countdown_enabled, cooled_required)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            dep_dt.isoformat(),
+            int(location_id),
+            "",
+            "GEPLANT",
+            note_clean,
+            source_key,
+            created_by,
+            int(sid),
+            1 if countdown_enabled else 0,
+            1 if cooled_required else 0,
+        ))
         created += 1
+
     conn.commit()
-    log_event(conn, "create", "manual_departure", details={"created": created, "datetime": dep_dt.isoformat(), "location_id": int(location_id), "screen_ids": screen_ids, "countdown_enabled": bool(countdown_enabled)})
+    log_event(conn, "create", "manual_departure", details={
+        "created": created,
+        "datetime": dep_dt.isoformat(),
+        "location_id": int(location_id),
+        "screen_ids": screen_ids,
+        "countdown_enabled": bool(countdown_enabled),
+        "cooled_required": bool(cooled_required),
+    })
 
 
 def get_screen_data(conn, screen_id: int):
@@ -878,10 +955,9 @@ def get_screen_data(conn, screen_id: int):
     start = now - timedelta(minutes=AUTO_COMPLETE_AFTER_MIN)
 
     deps = load_departures_with_locations(conn)
-
     required_cols = [
         "datetime", "location_active", "screen_id", "location_type", "location_id",
-        "status", "completed_at", "countdown_enabled", "note", "line_info",
+        "status", "completed_at", "countdown_enabled", "cooled_required", "note", "line_info",
         "location_name", "location_color", "location_text_color"
     ]
 
@@ -997,29 +1073,34 @@ def build_info_html(row) -> str:
     note = str(row.get("note") or "")
     line_info = str(row.get("line_info") or "")
     status = str(row.get("status") or "").upper()
+    cooled_required = int(row.get("cooled_required", 0) or 0) == 1
 
-    if not line_info and not note:
-        return ""
+    parts = []
 
-    line_info_html = escape_html(line_info)
-    if status == "BEREIT" and line_info:
-        line_info_html = f"<span class='ready-badge'>{escape_html(line_info)}</span>"
-    elif is_critical_countdown(row) and "countdown" in line_info.lower():
-        line_info_html = f"<span class='blink-countdown-critical'>{escape_html(line_info)}</span>"
-    elif is_urgent_countdown(row) and "countdown" in line_info.lower():
-        line_info_html = f"<span class='blink-countdown'>{escape_html(line_info)}</span>"
-
-    if note and line_info:
-        return f"{escape_html(note)} · {line_info_html}"
     if note:
-        return escape_html(note)
-    return line_info_html
+        parts.append(escape_html(note))
+
+    if line_info:
+        line_info_html = escape_html(line_info)
+        if status == "BEREIT":
+            line_info_html = f"<span class='ready-badge'>{escape_html(line_info)}</span>"
+        elif is_critical_countdown(row) and "countdown" in line_info.lower():
+            line_info_html = f"<span class='blink-countdown-critical'>{escape_html(line_info)}</span>"
+        elif is_urgent_countdown(row) and "countdown" in line_info.lower():
+            line_info_html = f"<span class='blink-countdown'>{escape_html(line_info)}</span>"
+        parts.append(line_info_html)
+
+    if cooled_required:
+        parts.append("<span class='cold-badge'>❄ Kühlware mitzunehmen</span>")
+
+    return " · ".join(parts)
 
 
 def render_big_table(headers, rows, row_colors=None, text_colors=None, html_cols=None):
     html_cols = set(html_cols or [])
     thead = "".join(f"<th>{escape_html(str(h))}</th>" for h in headers)
     body = ""
+
     rows = list(rows)
     for idx, r in enumerate(rows):
         style_parts = []
@@ -1032,6 +1113,7 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None, html_cols
             if tc:
                 style_parts.append(f"color:{tc};")
         style = f' style="{"".join(style_parts)}"' if style_parts else ""
+
         cells = []
         for cidx, c in enumerate(r):
             if cidx in html_cols:
@@ -1039,6 +1121,7 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None, html_cols
             else:
                 cells.append(f"<td>{escape_html(str(c or ''))}</td>")
         body += f"<tr{style}>{''.join(cells)}</tr>"
+
     st.markdown(f"""
         <table class="big-table">
           <thead><tr>{thead}</tr></thead>
@@ -1050,20 +1133,119 @@ def render_big_table(headers, rows, row_colors=None, text_colors=None, html_cols
 def base_display_css() -> str:
     return """
         <style>
-        #MainMenu {visibility:hidden;} footer {visibility:hidden;} header {visibility:hidden;}
-        .block-container {padding-top:0.35rem;padding-bottom:3.2rem;max-width: 99% !important;}
-        body,.block-container,.stMarkdown,.stText,div,span {font-size:34px !important;}
-        .big-table {width:100%;border-collapse:collapse;background:#fff;border-radius:14px;overflow:hidden;}
-        .big-table th,.big-table td {border-bottom:1px solid #d1d5db;padding:0.65em 0.95em;text-align:left;vertical-align:top;}
-        .big-table th {font-weight:900;background:#e5e7eb;color:#111827;}
-        .ticker {position:fixed;bottom:0;left:0;width:100%;background:#000;color:#fff;overflow:hidden;white-space:nowrap;z-index:9999;padding:.25rem 0;}
-        .ticker__inner {display:inline-block;padding-left:100%;animation:ticker-scroll 20s linear infinite;font-size:28px !important;}
-        @keyframes ticker-scroll {0% {transform:translateX(0);} 100% {transform:translateX(-100%);} }
-        .blink-countdown {color:#b91c1c;font-weight:900;animation:blinkUrgent 1s steps(2, start) infinite;}
-        .blink-countdown-critical {color:#7f1d1d;font-weight:900;background:#fecaca;padding:0 6px;border-radius:6px;animation:blinkCritical 0.7s steps(2, start) infinite;}
-        .ready-badge {color:#14532d;font-weight:900;background:#bbf7d0;padding:0 6px;border-radius:6px;}
-        @keyframes blinkUrgent {0% {opacity:1;} 50% {opacity:0.15;} 100% {opacity:1;}}
-        @keyframes blinkCritical {0% {opacity:1;} 50% {opacity:0.05;} 100% {opacity:1;}}
+        #MainMenu {visibility:hidden;}
+        footer {visibility:hidden;}
+        header {visibility:hidden;}
+
+        html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"], .main {
+            margin: 0 !important;
+            padding: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            overflow: hidden !important;
+            background: #0f172a !important;
+        }
+
+        .block-container {
+            max-width: 100vw !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            padding: 0.2rem 0.4rem 3rem 0.4rem !important;
+            margin: 0 !important;
+        }
+
+        body,.block-container,.stMarkdown,.stText,div,span {
+            font-size: 34px !important;
+        }
+
+        .big-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #fff;
+            border-radius: 14px;
+            overflow: hidden;
+        }
+
+        .big-table th,.big-table td {
+            border-bottom: 1px solid #d1d5db;
+            padding: 0.72em 1em;
+            text-align: left;
+            vertical-align: top;
+        }
+
+        .big-table th {
+            font-weight: 900;
+            background: #e5e7eb;
+            color: #111827;
+        }
+
+        .ticker {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            background: #000;
+            color: #fff;
+            overflow: hidden;
+            white-space: nowrap;
+            z-index: 9999;
+            padding: .25rem 0;
+        }
+
+        .ticker__inner {
+            display: inline-block;
+            padding-left: 100%;
+            animation: ticker-scroll 20s linear infinite;
+            font-size: 28px !important;
+        }
+
+        @keyframes ticker-scroll {
+            0% {transform:translateX(0);}
+            100% {transform:translateX(-100%);}
+        }
+
+        .blink-countdown {
+            color:#b91c1c;
+            font-weight:900;
+            animation:blinkUrgent 1s steps(2, start) infinite;
+        }
+
+        .blink-countdown-critical {
+            color:#7f1d1d;
+            font-weight:900;
+            background:#fecaca;
+            padding:0 6px;
+            border-radius:6px;
+            animation:blinkCritical 0.7s steps(2, start) infinite;
+        }
+
+        .ready-badge {
+            color:#14532d;
+            font-weight:900;
+            background:#bbf7d0;
+            padding:0 6px;
+            border-radius:6px;
+        }
+
+        .cold-badge {
+            color:#1e3a8a;
+            font-weight:900;
+            background:#dbeafe;
+            padding:0 6px;
+            border-radius:6px;
+        }
+
+        @keyframes blinkUrgent {
+            0% {opacity:1;}
+            50% {opacity:0.15;}
+            100% {opacity:1;}
+        }
+
+        @keyframes blinkCritical {
+            0% {opacity:1;}
+            50% {opacity:0.05;}
+            100% {opacity:1;}
+        }
         </style>
     """
 
@@ -1113,8 +1295,10 @@ def render_zone_overview_screen(conn, screen_id: int):
     for zid in zone_ids:
         _, zone_data = get_screen_data(conn, zid)
         zone_name = ZONE_NAME_MAP.get(zid, f"Zone {zid}")
+
         if zone_data is None or zone_data.empty:
             continue
+
         for _, r in zone_data.iterrows():
             info_html = build_info_html(r)
             all_rows.append([
@@ -1153,23 +1337,16 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
 
     st.markdown("""
         <style>
-        .split-wrapper {
-            display:grid;
-            grid-template-columns: 1fr 1px 1fr;
-            gap: 8px;
-            align-items:start;
-        }
         .split-monitor-card {
             background: #111827;
-            padding: 10px 14px 12px 14px;
-            min-height: 76vh;
+            padding: 8px 12px 10px 12px;
+            min-height: 94vh;
             border: 3px solid #1f2937;
-            border-radius: 20px;
+            border-radius: 16px;
             box-shadow: 0 18px 45px rgba(0,0,0,0.28);
         }
         .split-divider {
-            margin-top: 0;
-            min-height: 76vh;
+            min-height: 94vh;
             width: 1px;
             background: #d1d5db;
             border-radius: 1px;
@@ -1185,10 +1362,7 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
         </style>
     """, unsafe_allow_html=True)
 
-    st.markdown(f"## {title}")
-    st.caption(f"DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h")
-
-    col1, colmid, col2 = st.columns([1, 0.0008, 1])
+    col1, colmid, col2 = st.columns([1, 0.0006, 1])
 
     with col1:
         st.markdown("<div class='split-monitor-card'>", unsafe_allow_html=True)
@@ -1243,7 +1417,10 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
 
     ticker_text = get_combined_ticker_text(conn, [left_screen_id, right_screen_id])
     if ticker_text:
-        st.markdown(f"<div class='ticker'><div class='ticker__inner'>{escape_html(ticker_text)}</div></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='ticker'><div class='ticker__inner'>{escape_html(ticker_text)}</div></div>",
+            unsafe_allow_html=True
+        )
 
 # ==================================================
 # ADMIN VIEWS
@@ -1262,7 +1439,7 @@ def show_admin_departures(conn, can_edit: bool):
         view = deps.copy()
         view["Quelle"] = view["source_key"].astype(str).apply(lambda s: "TOUR" if s.startswith("TOUR:") else ("MANUELL" if s.startswith("MANUAL:") else "SONST"))
         view["Zeit"] = view["datetime"].apply(lambda d: ensure_tz(d).strftime("%d.%m.%Y %H:%M") if pd.notnull(d) else "")
-        st.dataframe(view[["Zeit", "screen_id", "location_name", "note", "status", "countdown_enabled", "Quelle"]], use_container_width=True, height=360)
+        st.dataframe(view[["Zeit", "screen_id", "location_name", "note", "status", "countdown_enabled", "cooled_required", "Quelle"]], use_container_width=True, height=360)
 
     if not can_edit:
         return
@@ -1282,12 +1459,24 @@ def show_admin_departures(conn, can_edit: bool):
         with c3:
             screen_ids = st.multiselect("Screens", options=screens["id"].tolist(), default=[1])
             countdown_enabled = st.checkbox("Countdown aktiv", True)
+            cooled_required = st.checkbox("Kühlware mitzunehmen", False)
         submitted = st.form_submit_button("Manuelle Abfahrt speichern")
 
     if submitted and screen_ids:
         hh, mm = map(int, dep_time.split(":"))
         dep_dt = datetime.combine(dep_date, dtime(hour=hh, minute=mm)).replace(tzinfo=TZ)
-        ok, _ = run_safe("Manuelle Abfahrt speichern", create_manual_departures, conn, dep_dt, int(loc_id), [int(s) for s in screen_ids], note, str(st.session_state.get("username") or "ADMIN"), countdown_enabled)
+        ok, _ = run_safe(
+            "Manuelle Abfahrt speichern",
+            create_manual_departures,
+            conn,
+            dep_dt,
+            int(loc_id),
+            [int(s) for s in screen_ids],
+            note,
+            str(st.session_state.get("username") or "ADMIN"),
+            countdown_enabled,
+            cooled_required,
+        )
         if ok:
             save_backup_to_dir(conn)
             cleanup_old_backups()
@@ -1421,7 +1610,7 @@ def show_admin_tours(conn, can_edit: bool):
     if not tours.empty:
         view = tours.copy()
         view["Zeit"] = view.apply(lambda r: f"{int(r['hour']):02d}:{int(r['minute']):02d}", axis=1)
-        st.dataframe(view[["id", "name", "weekday", "Zeit", "countdown_enabled", "location_name", "note", "active", "screen_ids"]], use_container_width=True, height=300)
+        st.dataframe(view[["id", "name", "weekday", "Zeit", "countdown_enabled", "cooled_required", "location_name", "note", "active", "screen_ids"]], use_container_width=True, height=300)
     else:
         st.info("Noch keine Touren vorhanden.")
 
@@ -1442,6 +1631,7 @@ def show_admin_tours(conn, can_edit: bool):
         with c3:
             screens_new = st.multiselect("Monitore", options=screens["id"].tolist())
         countdown_enabled = st.checkbox("Countdown aktiv", False)
+        cooled_required = st.checkbox("Kühlware mitzunehmen", False)
         stops_new = st.multiselect("Stops", options=locations["id"].tolist(), format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0])
         note_new = st.text_input("Hinweis")
         active_new = st.checkbox("Aktiv", True)
@@ -1450,12 +1640,26 @@ def show_admin_tours(conn, can_edit: bool):
         try:
             hh, mm = map(int, time_label.split(":"))
             cur = conn.cursor()
-            cur.execute("INSERT INTO tours (name, weekday, hour, minute, location_id, note, active, screen_ids, countdown_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (tour_name.strip(), weekday, hh, mm, int(stops_new[0]), note_new.strip(), 1 if active_new else 0, ",".join(map(str, screens_new)), 1 if countdown_enabled else 0))
+            cur.execute(
+                "INSERT INTO tours (name, weekday, hour, minute, location_id, note, active, screen_ids, countdown_enabled, cooled_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tour_name.strip(),
+                    weekday,
+                    hh,
+                    mm,
+                    int(stops_new[0]),
+                    note_new.strip(),
+                    1 if active_new else 0,
+                    ",".join(map(str, screens_new)),
+                    1 if countdown_enabled else 0,
+                    1 if cooled_required else 0,
+                ),
+            )
             tour_id = cur.lastrowid
             for pos, loc_id in enumerate(stops_new):
                 cur.execute("INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)", (tour_id, int(loc_id), pos))
             conn.commit()
-            log_event(conn, "create", "tour", entity_id=tour_id, details={"name": tour_name.strip(), "weekday": weekday, "screens": screens_new, "stops": stops_new})
+            log_event(conn, "create", "tour", entity_id=tour_id, details={"name": tour_name.strip(), "weekday": weekday, "screens": screens_new, "stops": stops_new, "cooled_required": bool(cooled_required)})
             save_backup_to_dir(conn)
             cleanup_old_backups()
             st.success("Tour gespeichert.")
@@ -1487,6 +1691,7 @@ def show_admin_tours(conn, can_edit: bool):
         with c3:
             edit_screens = st.multiselect("Monitore", options=screens["id"].tolist(), default=default_screens)
         edit_countdown = st.checkbox("Countdown aktiv", bool(int(row["countdown_enabled"])))
+        edit_cooled_required = st.checkbox("Kühlware mitzunehmen", bool(int(row.get("cooled_required", 0) or 0)))
         edit_stops = st.multiselect("Stops", options=locations["id"].tolist(), default=default_stops, format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0])
         edit_note = st.text_input("Hinweis", row["note"] or "")
         edit_active = st.checkbox("Aktiv", bool(row["active"]))
@@ -1497,13 +1702,28 @@ def show_admin_tours(conn, can_edit: bool):
         try:
             hh, mm = map(int, edit_time.split(":"))
             cur = conn.cursor()
-            cur.execute("UPDATE tours SET name=?, weekday=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=? WHERE id=?", (edit_name.strip(), edit_weekday, hh, mm, int(edit_stops[0]), edit_note.strip(), 1 if edit_active else 0, ",".join(map(str, edit_screens)), 1 if edit_countdown else 0, int(selected)))
+            cur.execute(
+                "UPDATE tours SET name=?, weekday=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=?, cooled_required=? WHERE id=?",
+                (
+                    edit_name.strip(),
+                    edit_weekday,
+                    hh,
+                    mm,
+                    int(edit_stops[0]),
+                    edit_note.strip(),
+                    1 if edit_active else 0,
+                    ",".join(map(str, edit_screens)),
+                    1 if edit_countdown else 0,
+                    1 if edit_cooled_required else 0,
+                    int(selected),
+                ),
+            )
             cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(selected),))
             for pos, loc_id in enumerate(edit_stops):
                 cur.execute("INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)", (int(selected), int(loc_id), pos))
             cur.execute("DELETE FROM departures WHERE source_key LIKE ?", (f"TOUR:{int(selected)}:%",))
             conn.commit()
-            log_event(conn, "update", "tour", entity_id=int(selected), details={"name": edit_name.strip(), "weekday": edit_weekday, "screens": edit_screens, "stops": edit_stops})
+            log_event(conn, "update", "tour", entity_id=int(selected), details={"name": edit_name.strip(), "weekday": edit_weekday, "screens": edit_screens, "stops": edit_stops, "cooled_required": bool(edit_cooled_required)})
             save_backup_to_dir(conn)
             cleanup_old_backups()
             st.success("Tour aktualisiert.")
@@ -1526,6 +1746,80 @@ def show_admin_tours(conn, can_edit: bool):
         except Exception as e:
             log_event(conn, "error", "tour", entity_id=int(selected), details={"message": str(e)}, level="ERROR")
             st.error(f"Tour löschen fehlgeschlagen: {e}")
+
+
+def show_admin_cold_goods(conn, can_edit: bool):
+    st.subheader("Kühlware")
+
+    if not can_edit:
+        st.info("Nur Admin kann Kühlware bearbeiten.")
+        return
+
+    deps = load_departures_with_locations(conn).sort_values("datetime")
+    tours = load_tours(conn)
+
+    tab1, tab2 = st.tabs(["Manuelle / kommende Abfahrten", "Touren"])
+
+    with tab1:
+        if deps.empty:
+            st.info("Keine Abfahrten vorhanden.")
+        else:
+            upcoming = deps.copy()
+            upcoming["label"] = upcoming.apply(
+                lambda r: f"{ensure_tz(r['datetime']).strftime('%d.%m.%Y %H:%M')} • Screen {r['screen_id']} • {r['location_name']}",
+                axis=1
+            )
+
+            selected = st.selectbox("Abfahrt auswählen", upcoming["label"].tolist(), key="cold_dep_select")
+            row = upcoming.loc[upcoming["label"] == selected].iloc[0]
+            dep_id = int(row["id"])
+            current_value = bool(int(row.get("cooled_required", 0) or 0))
+
+            new_value = st.checkbox("Kühlware mitzunehmen", value=current_value, key=f"cold_dep_chk_{dep_id}")
+
+            if st.button("Kühlware für Abfahrt speichern"):
+                try:
+                    conn.execute(
+                        "UPDATE departures SET cooled_required=? WHERE id=?",
+                        (1 if new_value else 0, dep_id)
+                    )
+                    conn.commit()
+                    log_event(conn, "update", "departure_cold_goods", entity_id=dep_id, details={"cooled_required": bool(new_value)})
+                    st.success("Kühlware aktualisiert.")
+                    st.rerun()
+                except Exception as e:
+                    log_event(conn, "error", "departure_cold_goods", entity_id=dep_id, details={"message": str(e)}, level="ERROR")
+                    st.error(f"Speichern fehlgeschlagen: {e}")
+
+    with tab2:
+        if tours.empty:
+            st.info("Keine Touren vorhanden.")
+        else:
+            tours["label"] = tours.apply(
+                lambda r: f"ID {int(r['id'])} • {r['name']} • {r['weekday']} {int(r['hour']):02d}:{int(r['minute']):02d}",
+                axis=1
+            )
+
+            selected_tour = st.selectbox("Tour auswählen", tours["label"].tolist(), key="cold_tour_select")
+            row = tours.loc[tours["label"] == selected_tour].iloc[0]
+            tour_id = int(row["id"])
+            current_value = bool(int(row.get("cooled_required", 0) or 0))
+
+            new_value = st.checkbox("Kühlware mitzunehmen", value=current_value, key=f"cold_tour_chk_{tour_id}")
+
+            if st.button("Kühlware für Tour speichern"):
+                try:
+                    conn.execute(
+                        "UPDATE tours SET cooled_required=? WHERE id=?",
+                        (1 if new_value else 0, tour_id)
+                    )
+                    conn.commit()
+                    log_event(conn, "update", "tour_cold_goods", entity_id=tour_id, details={"cooled_required": bool(new_value)})
+                    st.success("Kühlware bei Tour aktualisiert.")
+                    st.rerun()
+                except Exception as e:
+                    log_event(conn, "error", "tour_cold_goods", entity_id=tour_id, details={"message": str(e)}, level="ERROR")
+                    st.error(f"Speichern fehlgeschlagen: {e}")
 
 
 def show_admin_screens(conn, can_edit: bool):
@@ -1656,7 +1950,7 @@ def show_admin_mode():
         st.dataframe(audit_df, use_container_width=True, height=220)
 
     can_edit = role == "admin"
-    tabs = st.tabs(["Abfahrten", "Einrichtungen", "Touren", "Screens / Ticker"])
+    tabs = st.tabs(["Abfahrten", "Einrichtungen", "Touren", "Kühlware", "Screens / Ticker"])
     with tabs[0]:
         show_admin_departures(conn, can_edit)
     with tabs[1]:
@@ -1664,6 +1958,8 @@ def show_admin_mode():
     with tabs[2]:
         show_admin_tours(conn, can_edit)
     with tabs[3]:
+        show_admin_cold_goods(conn, can_edit)
+    with tabs[4]:
         show_admin_screens(conn, can_edit)
 
 # ==================================================
@@ -1707,11 +2003,11 @@ def show_display_mode(screen_id: int):
             labels.append("Feiertagsbelieferung")
         if bool(screen["special_flag"]):
             labels.append("Sonderplan")
-        st.markdown(f"<div style='display:flex;justify-content:center;align-items:center;height:100vh;background:#000;color:#fff;font-size:72px;font-weight:900;text-transform:uppercase;text-align:center;'>{' - '.join(labels)}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='display:flex;justify-content:center;align-items:center;height:100vh;background:#000;color:#fff;font-size:72px;font-weight:900;text-transform:uppercase;text-align:center;'>{' - '.join(labels)}</div>",
+            unsafe_allow_html=True
+        )
         return
-
-    st.markdown(f"## {screen['name']} (Screen {screen_id})")
-    st.caption(f"DE Ortszeit: {now_berlin().strftime('%d.%m.%Y %H:%M:%S')} • Anzeige: nächste {DISPLAY_WINDOW_HOURS}h")
 
     _, data = get_screen_data(conn, int(screen_id))
     if data.empty:
