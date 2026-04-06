@@ -137,7 +137,6 @@ def save_config(cfg: dict):
 
 
 APP_CONFIG = load_config()
-DEFAULT_USERS = APP_CONFIG["users"]
 ALLOW_DEFAULT_USERS = bool(APP_CONFIG.get("security", {}).get("allow_default_users", True))
 REQUIRE_SECRETS_IN_PRODUCTION = bool(APP_CONFIG.get("security", {}).get("require_secrets_in_production", False))
 PASSWORD_ITERATIONS = int(APP_CONFIG.get("security", {}).get("password_iterations", 200000))
@@ -436,6 +435,34 @@ def init_db(conn: sqlite3.Connection):
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS holiday_tours (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            holiday_date TEXT NOT NULL,
+            hour INTEGER NOT NULL,
+            minute INTEGER NOT NULL DEFAULT 0,
+            location_id INTEGER NOT NULL,
+            note TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            screen_ids TEXT,
+            countdown_enabled INTEGER NOT NULL DEFAULT 0,
+            cooled_required INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(location_id) REFERENCES locations(id)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS holiday_tour_stops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            holiday_tour_id INTEGER NOT NULL,
+            location_id INTEGER NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(holiday_tour_id) REFERENCES holiday_tours(id),
+            FOREIGN KEY(location_id) REFERENCES locations(id)
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS screens (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
@@ -541,6 +568,17 @@ def migrate_db(conn: sqlite3.Connection):
     if "cooled_required" not in tours:
         cur.execute("ALTER TABLE tours ADD COLUMN cooled_required INTEGER NOT NULL DEFAULT 0")
 
+    holiday_tours = table_cols("holiday_tours")
+    if holiday_tours:
+        if "minute" not in holiday_tours:
+            cur.execute("ALTER TABLE holiday_tours ADD COLUMN minute INTEGER NOT NULL DEFAULT 0")
+        if "screen_ids" not in holiday_tours:
+            cur.execute("ALTER TABLE holiday_tours ADD COLUMN screen_ids TEXT")
+        if "countdown_enabled" not in holiday_tours:
+            cur.execute("ALTER TABLE holiday_tours ADD COLUMN countdown_enabled INTEGER NOT NULL DEFAULT 0")
+        if "cooled_required" not in holiday_tours:
+            cur.execute("ALTER TABLE holiday_tours ADD COLUMN cooled_required INTEGER NOT NULL DEFAULT 0")
+
     conn.commit()
 
 
@@ -595,6 +633,27 @@ def load_tour_stops(conn, tour_id: int):
         WHERE ts.tour_id = ?
         ORDER BY ts.position
     """, (tour_id,))
+
+
+def load_holiday_tours(conn):
+    return read_df(conn, """
+        SELECT h.id, h.name, h.holiday_date, h.hour, h.minute, h.location_id,
+               h.note, h.active, h.screen_ids, h.countdown_enabled, h.cooled_required,
+               l.name AS location_name
+        FROM holiday_tours h
+        JOIN locations l ON h.location_id = l.id
+        ORDER BY h.holiday_date, h.hour, h.minute, h.id
+    """)
+
+
+def load_holiday_tour_stops(conn, holiday_tour_id: int):
+    return read_df(conn, """
+        SELECT hs.location_id, hs.position, l.name AS location_name
+        FROM holiday_tour_stops hs
+        JOIN locations l ON l.id = hs.location_id
+        WHERE hs.holiday_tour_id = ?
+        ORDER BY hs.position
+    """, (holiday_tour_id,))
 
 
 def load_departures_with_locations(conn):
@@ -697,10 +756,12 @@ def export_tours_csv(conn) -> tuple[bytes, bytes]:
 
 def export_backup_json(conn) -> bytes:
     tours = load_tours(conn)
-    items = []
+    holiday_tours = load_holiday_tours(conn)
+
+    tour_items = []
     for _, t in tours.iterrows():
         stops_df = load_tour_stops(conn, int(t["id"]))
-        items.append({
+        tour_items.append({
             "id": int(t["id"]),
             "name": str(t["name"]),
             "weekday": str(t["weekday"]),
@@ -714,11 +775,31 @@ def export_backup_json(conn) -> bytes:
             "cooled_required": int(t["cooled_required"] or 0),
             "stops": stops_df.to_dict(orient="records"),
         })
+
+    holiday_items = []
+    for _, h in holiday_tours.iterrows():
+        stops_df = load_holiday_tour_stops(conn, int(h["id"]))
+        holiday_items.append({
+            "id": int(h["id"]),
+            "name": str(h["name"]),
+            "holiday_date": str(h["holiday_date"]),
+            "hour": int(h["hour"]),
+            "minute": int(h["minute"] or 0),
+            "location_id": int(h["location_id"]),
+            "note": str(h["note"] or ""),
+            "active": int(h["active"]),
+            "screen_ids": str(h["screen_ids"] or ""),
+            "countdown_enabled": int(h["countdown_enabled"] or 0),
+            "cooled_required": int(h["cooled_required"] or 0),
+            "stops": stops_df.to_dict(orient="records"),
+        })
+
     payload = {
-        "version": 1,
+        "version": 2,
         "exported_at": now_berlin().isoformat(),
         "locations": load_locations(conn).to_dict(orient="records"),
-        "tours": items,
+        "tours": tour_items,
+        "holiday_tours": holiday_items,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
@@ -805,39 +886,62 @@ def import_backup_json(conn, data: dict):
                 cur.execute(
                     "UPDATE tours SET name=?, weekday=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=?, cooled_required=? WHERE id=?",
                     (
-                        t["name"],
-                        t["weekday"],
-                        int(t.get("hour", 0)),
-                        int(t.get("minute", 0)),
-                        int(t["location_id"]),
-                        t.get("note", ""),
-                        int(t.get("active", 1)),
-                        t.get("screen_ids", ""),
-                        int(t.get("countdown_enabled", 0)),
-                        int(t.get("cooled_required", 0)),
-                        int(tour_id),
+                        t["name"], t["weekday"], int(t.get("hour", 0)), int(t.get("minute", 0)),
+                        int(t["location_id"]), t.get("note", ""), int(t.get("active", 1)),
+                        t.get("screen_ids", ""), int(t.get("countdown_enabled", 0)),
+                        int(t.get("cooled_required", 0)), int(tour_id),
                     ),
                 )
             else:
                 cur.execute(
                     "INSERT INTO tours (id, name, weekday, hour, minute, location_id, note, active, screen_ids, countdown_enabled, cooled_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        int(tour_id),
-                        t["name"],
-                        t["weekday"],
-                        int(t.get("hour", 0)),
-                        int(t.get("minute", 0)),
-                        int(t["location_id"]),
-                        t.get("note", ""),
-                        int(t.get("active", 1)),
-                        t.get("screen_ids", ""),
-                        int(t.get("countdown_enabled", 0)),
-                        int(t.get("cooled_required", 0)),
+                        int(tour_id), t["name"], t["weekday"], int(t.get("hour", 0)),
+                        int(t.get("minute", 0)), int(t["location_id"]), t.get("note", ""),
+                        int(t.get("active", 1)), t.get("screen_ids", ""),
+                        int(t.get("countdown_enabled", 0)), int(t.get("cooled_required", 0)),
                     ),
                 )
             cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(tour_id),))
             for s in t.get("stops", []):
-                cur.execute("INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)", (int(tour_id), int(s["location_id"]), int(s.get("position", 0))))
+                cur.execute(
+                    "INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)",
+                    (int(tour_id), int(s["location_id"]), int(s.get("position", 0))),
+                )
+
+    for h in data.get("holiday_tours", []):
+        if not h.get("name"):
+            continue
+        hid = h.get("id")
+        if hid is not None:
+            cur.execute("SELECT COUNT(*) FROM holiday_tours WHERE id=?", (int(hid),))
+            exists = cur.fetchone()[0] > 0
+            if exists:
+                cur.execute(
+                    "UPDATE holiday_tours SET name=?, holiday_date=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=?, cooled_required=? WHERE id=?",
+                    (
+                        h["name"], h["holiday_date"], int(h.get("hour", 0)), int(h.get("minute", 0)),
+                        int(h["location_id"]), h.get("note", ""), int(h.get("active", 1)),
+                        h.get("screen_ids", ""), int(h.get("countdown_enabled", 0)),
+                        int(h.get("cooled_required", 0)), int(hid),
+                    ),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO holiday_tours (id, name, holiday_date, hour, minute, location_id, note, active, screen_ids, countdown_enabled, cooled_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(hid), h["name"], h["holiday_date"], int(h.get("hour", 0)),
+                        int(h.get("minute", 0)), int(h["location_id"]), h.get("note", ""),
+                        int(h.get("active", 1)), h.get("screen_ids", ""),
+                        int(h.get("countdown_enabled", 0)), int(h.get("cooled_required", 0)),
+                    ),
+                )
+            cur.execute("DELETE FROM holiday_tour_stops WHERE holiday_tour_id=?", (int(hid),))
+            for s in h.get("stops", []):
+                cur.execute(
+                    "INSERT INTO holiday_tour_stops (holiday_tour_id, location_id, position) VALUES (?, ?, ?)",
+                    (int(hid), int(s["location_id"]), int(s.get("position", 0))),
+                )
 
     conn.commit()
 
@@ -881,16 +985,15 @@ def update_departure_statuses(conn: sqlite3.Connection):
 
 
 def cleanup_materialized_departures(conn: sqlite3.Connection):
-    cutoff_old_tours = (now_berlin() - timedelta(days=2)).isoformat()
+    cutoff_old = (now_berlin() - timedelta(days=2)).isoformat()
     cutoff_completed = (now_berlin() - timedelta(days=1)).isoformat()
-    conn.execute("DELETE FROM departures WHERE source_key LIKE 'TOUR:%' AND datetime < ?", (cutoff_old_tours,))
+    conn.execute("DELETE FROM departures WHERE source_key LIKE 'TOUR:%' AND datetime < ?", (cutoff_old,))
+    conn.execute("DELETE FROM departures WHERE source_key LIKE 'HOLIDAY:%' AND datetime < ?", (cutoff_old,))
     conn.execute("DELETE FROM departures WHERE status='ABGESCHLOSSEN' AND completed_at IS NOT NULL AND completed_at < ?", (cutoff_completed,))
     conn.commit()
 
 
 def materialize_tours_to_departures(conn: sqlite3.Connection):
-    cleanup_materialized_departures(conn)
-
     now = now_berlin()
     window = timedelta(hours=MATERIALIZE_TOURS_HOURS_BEFORE)
     df = read_df(conn, """
@@ -920,6 +1023,7 @@ def materialize_tours_to_departures(conn: sqlite3.Connection):
         dep_dt = next_datetime_for_weekday_time(weekday, int(r["hour"]), int(r["minute"]))
         if dep_dt - now > window:
             continue
+
         for sid in screen_ids:
             source_key = f"TOUR:{int(r['tour_id'])}:{int(r['position'])}:{sid}:{dep_dt.isoformat()}"
             try:
@@ -937,6 +1041,79 @@ def materialize_tours_to_departures(conn: sqlite3.Connection):
                     sid,
                     int(r["tour_countdown_enabled"] or 0),
                     int(r["tour_cooled_required"] or 0),
+                ))
+                created_any = True
+            except sqlite3.IntegrityError:
+                pass
+
+    if created_any:
+        conn.commit()
+
+
+def materialize_holiday_tours_to_departures(conn: sqlite3.Connection):
+    now = now_berlin()
+    window_start = (now - timedelta(minutes=AUTO_COMPLETE_AFTER_MIN)).date()
+    window_end = (now + timedelta(hours=MATERIALIZE_TOURS_HOURS_BEFORE)).date()
+
+    df = read_df(conn, """
+        SELECT h.id AS holiday_tour_id,
+               h.holiday_date,
+               h.hour,
+               h.minute,
+               h.note AS holiday_note,
+               h.active AS holiday_active,
+               h.screen_ids AS holiday_screen_ids,
+               h.countdown_enabled AS holiday_countdown_enabled,
+               h.cooled_required AS holiday_cooled_required,
+               hs.location_id,
+               hs.position,
+               l.active AS location_active
+        FROM holiday_tours h
+        JOIN holiday_tour_stops hs ON hs.holiday_tour_id = h.id
+        JOIN locations l ON l.id = hs.location_id
+    """)
+    if df.empty:
+        return
+
+    df = df[(df["holiday_active"] == 1) & (df["location_active"] == 1)].copy()
+    cur = conn.cursor()
+    created_any = False
+
+    for _, r in df.iterrows():
+        try:
+            holiday_date = pd.to_datetime(r["holiday_date"]).date()
+        except Exception:
+            continue
+
+        if holiday_date < window_start or holiday_date > window_end:
+            continue
+
+        screen_ids = parse_screen_ids(r["holiday_screen_ids"])
+        if not screen_ids:
+            continue
+
+        dep_dt = datetime.combine(
+            holiday_date,
+            dtime(hour=int(r["hour"]), minute=int(r["minute"]))
+        ).replace(tzinfo=TZ)
+
+        for sid in screen_ids:
+            source_key = f"HOLIDAY:{int(r['holiday_tour_id'])}:{int(r['position'])}:{sid}:{dep_dt.isoformat()}"
+            try:
+                execute_with_retry(cur, """
+                    INSERT INTO departures (datetime, location_id, vehicle, status, note, source_key, created_by, screen_id, countdown_enabled, cooled_required)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    dep_dt.isoformat(),
+                    int(r["location_id"]),
+                    "",
+                    "GEPLANT",
+                    str(r["holiday_note"] or ""),
+                    source_key,
+                    "HOLIDAY_AUTO",
+                    int(sid),
+                    int(r["holiday_countdown_enabled"] or 0),
+                    int(r["holiday_cooled_required"] or 0),
                 ))
                 created_any = True
             except sqlite3.IntegrityError:
@@ -1033,7 +1210,7 @@ def get_screen_data(conn, screen_id: int):
 
     deps = load_departures_with_locations(conn)
     required_cols = [
-        "datetime", "location_active", "screen_id", "location_type", "location_id",
+        "id", "datetime", "location_active", "screen_id", "location_type", "location_id",
         "status", "completed_at", "countdown_enabled", "cooled_required", "note", "line_info",
         "location_name", "location_color", "location_text_color"
     ]
@@ -1115,7 +1292,7 @@ def get_screen_data(conn, screen_id: int):
 
 
 # ==================================================
-# V2 VISUAL HELPERS
+# VISUAL HELPERS
 # ==================================================
 
 
@@ -1496,7 +1673,6 @@ def render_zone_overview_screen(conn, screen_id: int):
     row_backgrounds = []
     text_colors = []
     extra_css = []
-
     combined_df_parts = []
 
     for zid in zone_ids:
@@ -1642,19 +1818,20 @@ def render_split_screen(conn, left_screen_id: int, right_screen_id: int, title: 
 # ADMIN ZUSATZ
 # ==================================================
 
+
 def show_admin_users(can_edit: bool):
     st.subheader("Benutzer")
 
     users = get_runtime_users()
-    display_rows = []
+    rows = []
     for uname, data in users.items():
         pw = str(data.get("password", ""))
-        display_rows.append({
+        rows.append({
             "Benutzername": uname,
             "Rolle": data.get("role", "viewer"),
             "Passwort gespeichert als": "Hash" if pw.startswith("pbkdf2_sha256$") else "Klartext/Fallback",
         })
-    st.dataframe(pd.DataFrame(display_rows), use_container_width=True, height=240)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, height=220)
 
     if not can_edit:
         st.info("Nur Admin kann Benutzer verwalten.")
@@ -1687,40 +1864,38 @@ def show_admin_users(can_edit: bool):
             st.success("Benutzer angelegt.")
             st.rerun()
 
-    if not users:
-        return
+    if users:
+        st.markdown("### Benutzer bearbeiten / löschen")
+        selected_user = st.selectbox("Benutzer auswählen", list(users.keys()), key="edit_user_select")
+        selected_data = users[selected_user]
 
-    st.markdown("### Benutzer bearbeiten / löschen")
-    selected_user = st.selectbox("Benutzer auswählen", list(users.keys()), key="edit_user_select")
-    selected_data = users[selected_user]
+        with st.form("edit_user_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                edit_role = st.selectbox("Rolle", ["viewer", "admin"], index=["viewer", "admin"].index(selected_data.get("role", "viewer")))
+            with c2:
+                edit_password = st.text_input("Neues Passwort (optional)", type="password")
+            csave, cdel = st.columns(2)
+            save_user = csave.form_submit_button("Benutzer speichern")
+            delete_user = cdel.form_submit_button("Benutzer löschen")
 
-    with st.form("edit_user_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            edit_role = st.selectbox("Rolle", ["viewer", "admin"], index=["viewer", "admin"].index(selected_data.get("role", "viewer")))
-        with c2:
-            edit_password = st.text_input("Neues Passwort (optional)", type="password")
-        csave, cdel = st.columns(2)
-        save_user = csave.form_submit_button("Benutzer speichern")
-        delete_user = cdel.form_submit_button("Benutzer löschen")
-
-    if save_user:
-        users[selected_user]["role"] = edit_role
-        if edit_password:
-            users[selected_user]["password"] = hash_password(edit_password)
-        save_runtime_users(users)
-        st.success("Benutzer gespeichert.")
-        st.rerun()
-
-    if delete_user:
-        current_username = st.session_state.get("username")
-        if selected_user == current_username:
-            st.error("Du kannst den aktuell eingeloggten Benutzer nicht löschen.")
-        else:
-            users.pop(selected_user, None)
+        if save_user:
+            users[selected_user]["role"] = edit_role
+            if edit_password:
+                users[selected_user]["password"] = hash_password(edit_password)
             save_runtime_users(users)
-            st.success("Benutzer gelöscht.")
+            st.success("Benutzer gespeichert.")
             st.rerun()
+
+        if delete_user:
+            current_username = st.session_state.get("username")
+            if selected_user == current_username:
+                st.error("Du kannst den aktuell eingeloggten Benutzer nicht löschen.")
+            else:
+                users.pop(selected_user, None)
+                save_runtime_users(users)
+                st.success("Benutzer gelöscht.")
+                st.rerun()
 
 
 def show_system_status(conn):
@@ -1733,12 +1908,13 @@ def show_system_status(conn):
     with c2:
         tours_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM tours").iloc[0]["c"])
         loc_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM locations").iloc[0]["c"])
+        holiday_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM holiday_tours").iloc[0]["c"])
         st.metric("Touren", tours_count)
-        st.caption(f"Einrichtungen: {loc_count}")
+        st.caption(f"Einrichtungen: {loc_count} • Feiertagsbelieferung: {holiday_count}")
     with c3:
         dep_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM departures").iloc[0]["c"])
         today_start = datetime.combine(now_berlin().date(), dtime(0, 0)).replace(tzinfo=TZ).isoformat()
-        today_end = (datetime.combine(now_berlin().date(), dtime(23, 59, 59)).replace(tzinfo=TZ)).isoformat()
+        today_end = datetime.combine(now_berlin().date(), dtime(23, 59, 59)).replace(tzinfo=TZ).isoformat()
         todays_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM departures WHERE datetime BETWEEN ? AND ?", (today_start, today_end)).iloc[0]["c"])
         st.metric("Abfahrten gesamt", dep_count)
         st.caption(f"Heute: {todays_count}")
@@ -1772,9 +1948,11 @@ def show_system_status(conn):
 # ADMIN VIEWS
 # ==================================================
 
+
 def show_admin_departures(conn, can_edit: bool):
     st.subheader("Abfahrten")
     materialize_tours_to_departures(conn)
+    materialize_holiday_tours_to_departures(conn)
     update_departure_statuses(conn)
 
     deps = load_departures_with_locations(conn).sort_values("datetime")
@@ -1784,7 +1962,10 @@ def show_admin_departures(conn, can_edit: bool):
         with c1:
             search_text = st.text_input("Suche Einrichtung / Hinweis", "")
         with c2:
-            screen_filter = st.selectbox("Screen", ["ALLE"] + sorted([str(i) for i in deps["screen_id"].dropna().astype(int).unique().tolist()]) if not deps.empty else ["ALLE"])
+            screen_options = ["ALLE"]
+            if not deps.empty:
+                screen_options += sorted([str(i) for i in deps["screen_id"].dropna().astype(int).unique().tolist()])
+            screen_filter = st.selectbox("Screen", screen_options)
         with c3:
             status_filter = st.selectbox("Status", ["ALLE", "GEPLANT", "BEREIT", "ABGESCHLOSSEN"])
         with c4:
@@ -1805,7 +1986,11 @@ def show_admin_departures(conn, can_edit: bool):
         if cold_only:
             view = view[view["cooled_required"] == 1]
 
-        view["Quelle"] = view["source_key"].astype(str).apply(lambda s: "TOUR" if s.startswith("TOUR:") else ("MANUELL" if s.startswith("MANUAL:") else "SONST"))
+        view["Quelle"] = view["source_key"].astype(str).apply(
+            lambda s: "TOUR" if s.startswith("TOUR:")
+            else ("FEIERTAG" if s.startswith("HOLIDAY:")
+            else ("MANUELL" if s.startswith("MANUAL:") else "SONST"))
+        )
         view["Zeit"] = view["datetime"].apply(lambda d: ensure_tz(d).strftime("%d.%m.%Y %H:%M") if pd.notnull(d) else "")
         st.dataframe(view[["id", "Zeit", "screen_id", "location_name", "note", "status", "countdown_enabled", "cooled_required", "Quelle"]], use_container_width=True, height=360)
     else:
@@ -2010,9 +2195,11 @@ def show_admin_locations(conn, can_edit: bool):
     if delete:
         dep_count = read_df(conn, "SELECT COUNT(*) AS c FROM departures WHERE location_id=?", (int(selected),)).iloc[0]["c"]
         tour_count = read_df(conn, "SELECT COUNT(*) AS c FROM tours WHERE location_id=?", (int(selected),)).iloc[0]["c"]
+        holiday_count = read_df(conn, "SELECT COUNT(*) AS c FROM holiday_tours WHERE location_id=?", (int(selected),)).iloc[0]["c"]
         stop_count = read_df(conn, "SELECT COUNT(*) AS c FROM tour_stops WHERE location_id=?", (int(selected),)).iloc[0]["c"]
-        if dep_count or tour_count or stop_count:
-            st.error(f"Kann nicht löschen: Abfahrten={dep_count}, Touren={tour_count}, Stops={stop_count}")
+        holiday_stop_count = read_df(conn, "SELECT COUNT(*) AS c FROM holiday_tour_stops WHERE location_id=?", (int(selected),)).iloc[0]["c"]
+        if dep_count or tour_count or holiday_count or stop_count or holiday_stop_count:
+            st.error(f"Kann nicht löschen: Abfahrten={dep_count}, Touren={tour_count}, Feiertag={holiday_count}, Stops={stop_count}, Feiertag-Stops={holiday_stop_count}")
         else:
             conn.execute("DELETE FROM locations WHERE id=?", (int(selected),))
             conn.commit()
@@ -2196,6 +2383,190 @@ def show_admin_tours(conn, can_edit: bool):
             st.error(f"Tour löschen fehlgeschlagen: {e}")
 
 
+def show_admin_holiday_tours(conn, can_edit: bool):
+    st.subheader("Feiertagsbelieferung")
+
+    holiday_tours = load_holiday_tours(conn)
+
+    if not holiday_tours.empty:
+        view = holiday_tours.copy()
+        view["Zeit"] = view.apply(lambda r: f"{int(r['hour']):02d}:{int(r['minute']):02d}", axis=1)
+        st.dataframe(
+            view[["id", "name", "holiday_date", "Zeit", "countdown_enabled", "cooled_required", "location_name", "note", "active", "screen_ids"]],
+            use_container_width=True,
+            height=300
+        )
+    else:
+        st.info("Noch keine Feiertagsbelieferungen vorhanden.")
+
+    if not can_edit:
+        return
+
+    locations = load_locations(conn)
+    screens = load_screens(conn)
+
+    st.markdown("### Neue Feiertagsbelieferung")
+    with st.form("new_holiday_tour_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            holiday_name = st.text_input("Name")
+            holiday_date = st.date_input("Datum")
+        with c2:
+            holiday_time = st.selectbox("Uhrzeit", time_options_half_hour(), index=time_options_half_hour().index("08:00"))
+        with c3:
+            holiday_screens = st.multiselect("Monitore", options=screens["id"].tolist())
+
+        holiday_countdown = st.checkbox("Countdown aktiv", False)
+        holiday_cooled = st.checkbox("Kühlware mitzunehmen", False)
+        holiday_stops = st.multiselect(
+            "Stops",
+            options=locations["id"].tolist(),
+            format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0]
+        )
+        holiday_note = st.text_input("Hinweis")
+        holiday_active = st.checkbox("Aktiv", True)
+
+        create_holiday = st.form_submit_button("Feiertagsbelieferung speichern")
+
+    if create_holiday and holiday_name.strip() and holiday_screens and holiday_stops:
+        try:
+            hh, mm = map(int, holiday_time.split(":"))
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO holiday_tours
+                (name, holiday_date, hour, minute, location_id, note, active, screen_ids, countdown_enabled, cooled_required)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                holiday_name.strip(),
+                holiday_date.isoformat(),
+                hh,
+                mm,
+                int(holiday_stops[0]),
+                holiday_note.strip(),
+                1 if holiday_active else 0,
+                ",".join(map(str, holiday_screens)),
+                1 if holiday_countdown else 0,
+                1 if holiday_cooled else 0,
+            ))
+            holiday_tour_id = cur.lastrowid
+            for pos, loc_id in enumerate(holiday_stops):
+                cur.execute(
+                    "INSERT INTO holiday_tour_stops (holiday_tour_id, location_id, position) VALUES (?, ?, ?)",
+                    (holiday_tour_id, int(loc_id), pos)
+                )
+            conn.commit()
+            log_event(conn, "create", "holiday_tour", entity_id=holiday_tour_id, details={
+                "name": holiday_name.strip(),
+                "holiday_date": holiday_date.isoformat(),
+                "screens": holiday_screens,
+                "stops": holiday_stops,
+            })
+            save_backup_to_dir(conn)
+            cleanup_old_backups()
+            st.success("Feiertagsbelieferung gespeichert.")
+            st.rerun()
+        except Exception as e:
+            log_event(conn, "error", "holiday_tour", details={"message": str(e)}, level="ERROR")
+            st.error(f"Speichern fehlgeschlagen: {e}")
+
+    if holiday_tours.empty:
+        return
+
+    st.markdown("### Feiertagsbelieferung bearbeiten / löschen")
+    selected = st.selectbox("Feiertagsbelieferung auswählen", holiday_tours["id"].tolist(), key="edit_holiday_tour_select")
+    row = holiday_tours.loc[holiday_tours["id"] == selected].iloc[0]
+    stops_df = load_holiday_tour_stops(conn, int(selected))
+    default_stops = stops_df["location_id"].tolist() if not stops_df.empty else [int(row["location_id"])]
+    default_screens = parse_screen_ids(row["screen_ids"])
+    current_time = f"{int(row['hour']):02d}:{int(row['minute']):02d}"
+    if current_time not in time_options_half_hour():
+        current_time = "08:00"
+
+    with st.form("edit_holiday_tour_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            edit_name = st.text_input("Name", row["name"])
+            edit_date = st.date_input("Datum", value=pd.to_datetime(row["holiday_date"]).date())
+        with c2:
+            edit_time = st.selectbox("Uhrzeit", time_options_half_hour(), index=time_options_half_hour().index(current_time))
+        with c3:
+            edit_screens = st.multiselect("Monitore", options=screens["id"].tolist(), default=default_screens)
+
+        edit_countdown = st.checkbox("Countdown aktiv", bool(int(row["countdown_enabled"])))
+        edit_cooled = st.checkbox("Kühlware mitzunehmen", bool(int(row.get("cooled_required", 0) or 0)))
+        edit_stops = st.multiselect(
+            "Stops",
+            options=locations["id"].tolist(),
+            default=default_stops,
+            format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0]
+        )
+        edit_note = st.text_input("Hinweis", row["note"] or "")
+        edit_active = st.checkbox("Aktiv", bool(row["active"]))
+
+        csave, cdel = st.columns(2)
+        save_holiday = csave.form_submit_button("Änderungen speichern")
+        delete_holiday = cdel.form_submit_button("Feiertagsbelieferung löschen")
+
+    if save_holiday and edit_name.strip() and edit_screens and edit_stops:
+        try:
+            hh, mm = map(int, edit_time.split(":"))
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE holiday_tours
+                SET name=?, holiday_date=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=?, cooled_required=?
+                WHERE id=?
+            """, (
+                edit_name.strip(),
+                edit_date.isoformat(),
+                hh,
+                mm,
+                int(edit_stops[0]),
+                edit_note.strip(),
+                1 if edit_active else 0,
+                ",".join(map(str, edit_screens)),
+                1 if edit_countdown else 0,
+                1 if edit_cooled else 0,
+                int(selected),
+            ))
+            cur.execute("DELETE FROM holiday_tour_stops WHERE holiday_tour_id=?", (int(selected),))
+            for pos, loc_id in enumerate(edit_stops):
+                cur.execute(
+                    "INSERT INTO holiday_tour_stops (holiday_tour_id, location_id, position) VALUES (?, ?, ?)",
+                    (int(selected), int(loc_id), pos)
+                )
+            cur.execute("DELETE FROM departures WHERE source_key LIKE ?", (f"HOLIDAY:{int(selected)}:%",))
+            conn.commit()
+            log_event(conn, "update", "holiday_tour", entity_id=int(selected), details={
+                "name": edit_name.strip(),
+                "holiday_date": edit_date.isoformat(),
+                "screens": edit_screens,
+                "stops": edit_stops,
+            })
+            save_backup_to_dir(conn)
+            cleanup_old_backups()
+            st.success("Feiertagsbelieferung aktualisiert.")
+            st.rerun()
+        except Exception as e:
+            log_event(conn, "error", "holiday_tour", entity_id=int(selected), details={"message": str(e)}, level="ERROR")
+            st.error(f"Aktualisieren fehlgeschlagen: {e}")
+
+    if delete_holiday:
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM departures WHERE source_key LIKE ?", (f"HOLIDAY:{int(selected)}:%",))
+            cur.execute("DELETE FROM holiday_tour_stops WHERE holiday_tour_id=?", (int(selected),))
+            cur.execute("DELETE FROM holiday_tours WHERE id=?", (int(selected),))
+            conn.commit()
+            log_event(conn, "delete", "holiday_tour", entity_id=int(selected), details={"name": str(row['name'])})
+            save_backup_to_dir(conn)
+            cleanup_old_backups()
+            st.success("Feiertagsbelieferung gelöscht.")
+            st.rerun()
+        except Exception as e:
+            log_event(conn, "error", "holiday_tour", entity_id=int(selected), details={"message": str(e)}, level="ERROR")
+            st.error(f"Löschen fehlgeschlagen: {e}")
+
+
 def show_admin_cold_goods(conn, can_edit: bool):
     st.subheader("Kühlware")
 
@@ -2205,8 +2576,9 @@ def show_admin_cold_goods(conn, can_edit: bool):
 
     deps = load_departures_with_locations(conn).sort_values("datetime")
     tours = load_tours(conn)
+    holiday_tours = load_holiday_tours(conn)
 
-    tab1, tab2 = st.tabs(["Manuelle / kommende Abfahrten", "Touren"])
+    tab1, tab2, tab3 = st.tabs(["Manuelle / kommende Abfahrten", "Touren", "Feiertagsbelieferung"])
 
     with tab1:
         if deps.empty:
@@ -2247,26 +2619,46 @@ def show_admin_cold_goods(conn, can_edit: bool):
                 lambda r: f"ID {int(r['id'])} • {r['name']} • {r['weekday']} {int(r['hour']):02d}:{int(r['minute']):02d}",
                 axis=1
             )
-
             selected_tour = st.selectbox("Tour auswählen", tours["label"].tolist(), key="cold_tour_select")
             row = tours.loc[tours["label"] == selected_tour].iloc[0]
             tour_id = int(row["id"])
             current_value = bool(int(row.get("cooled_required", 0) or 0))
-
             new_value = st.checkbox("Kühlware mitzunehmen", value=current_value, key=f"cold_tour_chk_{tour_id}")
 
             if st.button("Kühlware für Tour speichern"):
                 try:
-                    conn.execute(
-                        "UPDATE tours SET cooled_required=? WHERE id=?",
-                        (1 if new_value else 0, tour_id)
-                    )
+                    conn.execute("UPDATE tours SET cooled_required=? WHERE id=?", (1 if new_value else 0, tour_id))
                     conn.commit()
                     log_event(conn, "update", "tour_cold_goods", entity_id=tour_id, details={"cooled_required": bool(new_value)})
                     st.success("Kühlware bei Tour aktualisiert.")
                     st.rerun()
                 except Exception as e:
                     log_event(conn, "error", "tour_cold_goods", entity_id=tour_id, details={"message": str(e)}, level="ERROR")
+                    st.error(f"Speichern fehlgeschlagen: {e}")
+
+    with tab3:
+        if holiday_tours.empty:
+            st.info("Keine Feiertagsbelieferung vorhanden.")
+        else:
+            holiday_tours["label"] = holiday_tours.apply(
+                lambda r: f"ID {int(r['id'])} • {r['name']} • {r['holiday_date']} {int(r['hour']):02d}:{int(r['minute']):02d}",
+                axis=1
+            )
+            selected_holiday = st.selectbox("Feiertagsbelieferung auswählen", holiday_tours["label"].tolist(), key="cold_holiday_select")
+            row = holiday_tours.loc[holiday_tours["label"] == selected_holiday].iloc[0]
+            holiday_id = int(row["id"])
+            current_value = bool(int(row.get("cooled_required", 0) or 0))
+            new_value = st.checkbox("Kühlware mitzunehmen", value=current_value, key=f"cold_holiday_chk_{holiday_id}")
+
+            if st.button("Kühlware für Feiertagsbelieferung speichern"):
+                try:
+                    conn.execute("UPDATE holiday_tours SET cooled_required=? WHERE id=?", (1 if new_value else 0, holiday_id))
+                    conn.commit()
+                    log_event(conn, "update", "holiday_tour_cold_goods", entity_id=holiday_id, details={"cooled_required": bool(new_value)})
+                    st.success("Kühlware bei Feiertagsbelieferung aktualisiert.")
+                    st.rerun()
+                except Exception as e:
+                    log_event(conn, "error", "holiday_tour_cold_goods", entity_id=holiday_id, details={"message": str(e)}, level="ERROR")
                     st.error(f"Speichern fehlgeschlagen: {e}")
 
 
@@ -2322,134 +2714,12 @@ def show_admin_screens(conn, can_edit: bool):
             st.error(f"Screen speichern fehlgeschlagen: {e}")
 
 
-def show_admin_users(can_edit: bool):
-    st.subheader("Benutzer")
-
-    users = get_runtime_users()
-    rows = []
-    for uname, data in users.items():
-        pw = str(data.get("password", ""))
-        rows.append({
-            "Benutzername": uname,
-            "Rolle": data.get("role", "viewer"),
-            "Passwort gespeichert als": "Hash" if pw.startswith("pbkdf2_sha256$") else "Klartext/Fallback",
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, height=220)
-
-    if not can_edit:
-        st.info("Nur Admin kann Benutzer verwalten.")
-        return
-
-    st.markdown("### Neuer Benutzer")
-    with st.form("new_user_form"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            new_username = st.text_input("Benutzername")
-        with c2:
-            new_password = st.text_input("Passwort", type="password")
-        with c3:
-            new_role = st.selectbox("Rolle", ["viewer", "admin"])
-        add_user = st.form_submit_button("Benutzer anlegen")
-
-    if add_user:
-        if not new_username.strip():
-            st.error("Benutzername fehlt.")
-        elif not new_password:
-            st.error("Passwort fehlt.")
-        elif new_username in users:
-            st.error("Benutzer existiert bereits.")
-        else:
-            users[new_username.strip()] = {
-                "password": hash_password(new_password),
-                "role": new_role,
-            }
-            save_runtime_users(users)
-            st.success("Benutzer angelegt.")
-            st.rerun()
-
-    if users:
-        st.markdown("### Benutzer bearbeiten / löschen")
-        selected_user = st.selectbox("Benutzer auswählen", list(users.keys()), key="edit_user_select")
-        selected_data = users[selected_user]
-
-        with st.form("edit_user_form"):
-            c1, c2 = st.columns(2)
-            with c1:
-                edit_role = st.selectbox("Rolle", ["viewer", "admin"], index=["viewer", "admin"].index(selected_data.get("role", "viewer")))
-            with c2:
-                edit_password = st.text_input("Neues Passwort (optional)", type="password")
-            csave, cdel = st.columns(2)
-            save_user = csave.form_submit_button("Benutzer speichern")
-            delete_user = cdel.form_submit_button("Benutzer löschen")
-
-        if save_user:
-            users[selected_user]["role"] = edit_role
-            if edit_password:
-                users[selected_user]["password"] = hash_password(edit_password)
-            save_runtime_users(users)
-            st.success("Benutzer gespeichert.")
-            st.rerun()
-
-        if delete_user:
-            current_username = st.session_state.get("username")
-            if selected_user == current_username:
-                st.error("Du kannst den aktuell eingeloggten Benutzer nicht löschen.")
-            else:
-                users.pop(selected_user, None)
-                save_runtime_users(users)
-                st.success("Benutzer gelöscht.")
-                st.rerun()
-
-
-def show_system_status(conn):
-    st.subheader("Systemstatus")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Datenbank OK", "Ja" if integrity_ok(conn) else "Nein")
-        st.caption(str(DB_PATH))
-    with c2:
-        tours_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM tours").iloc[0]["c"])
-        loc_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM locations").iloc[0]["c"])
-        st.metric("Touren", tours_count)
-        st.caption(f"Einrichtungen: {loc_count}")
-    with c3:
-        dep_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM departures").iloc[0]["c"])
-        today_start = datetime.combine(now_berlin().date(), dtime(0, 0)).replace(tzinfo=TZ).isoformat()
-        today_end = datetime.combine(now_berlin().date(), dtime(23, 59, 59)).replace(tzinfo=TZ).isoformat()
-        todays_count = int(read_df(conn, "SELECT COUNT(*) AS c FROM departures WHERE datetime BETWEEN ? AND ?", (today_start, today_end)).iloc[0]["c"])
-        st.metric("Abfahrten gesamt", dep_count)
-        st.caption(f"Heute: {todays_count}")
-
-    st.markdown("### Letzte Backups")
-    backups = sorted(BACKUP_DIR.glob("backup_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]
-    if not backups:
-        st.info("Keine Backups vorhanden.")
-    else:
-        rows = []
-        for p in backups:
-            rows.append({
-                "Datei": p.name,
-                "Zeit": datetime.fromtimestamp(p.stat().st_mtime, TZ).strftime("%d.%m.%Y %H:%M:%S"),
-                "Größe KB": round(p.stat().st_size / 1024, 1),
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, height=220)
-
-    st.markdown("### Letzter Log-Eintrag")
-    if APP_LOG_PATH.exists():
-        try:
-            last_line = APP_LOG_PATH.read_text(encoding="utf-8").strip().splitlines()[-1]
-            st.code(last_line, language="json")
-        except Exception:
-            st.info("Logdatei vorhanden, letzter Eintrag konnte nicht gelesen werden.")
-    else:
-        st.info("Noch keine Logdatei vorhanden.")
-
-
 def show_admin_mode():
     require_login()
     conn = get_connection()
+    cleanup_materialized_departures(conn)
     materialize_tours_to_departures(conn)
+    materialize_holiday_tours_to_departures(conn)
     update_departure_statuses(conn)
     maybe_run_nightly_backup(conn)
 
@@ -2470,6 +2740,7 @@ def show_admin_mode():
         "Abfahrten",
         "Einrichtungen",
         "Touren",
+        "Feiertagsbelieferung",
         "Kühlware",
         "Screens / Ticker",
         "Benutzer",
@@ -2486,12 +2757,14 @@ def show_admin_mode():
     with tabs[2]:
         show_admin_tours(conn, can_edit)
     with tabs[3]:
-        show_admin_cold_goods(conn, can_edit)
+        show_admin_holiday_tours(conn, can_edit)
     with tabs[4]:
-        show_admin_screens(conn, can_edit)
+        show_admin_cold_goods(conn, can_edit)
     with tabs[5]:
-        show_admin_users(can_edit)
+        show_admin_screens(conn, can_edit)
     with tabs[6]:
+        show_admin_users(can_edit)
+    with tabs[7]:
         st.subheader("Wartung")
         c1, c2, c3 = st.columns(3)
 
@@ -2505,7 +2778,7 @@ def show_admin_mode():
                     st.error("Datenbankprüfung fehlgeschlagen.")
 
         with c2:
-            if st.button("Alte Tour-Abfahrten bereinigen"):
+            if st.button("Materialisierte Abfahrten bereinigen"):
                 try:
                     cleanup_materialized_departures(conn)
                     log_event(conn, "maintenance_cleanup", "departures")
@@ -2525,7 +2798,7 @@ def show_admin_mode():
                     log_event(conn, "error", "backup", details={"message": str(e)}, level="ERROR")
                     st.error(f"Backup fehlgeschlagen: {e}")
 
-    with tabs[7]:
+    with tabs[8]:
         st.subheader("Backup")
         c1, c2 = st.columns(2)
 
@@ -2553,7 +2826,7 @@ def show_admin_mode():
                     log_event(conn, "error", "backup_import", details={"message": str(e)}, level="ERROR")
                     st.error(f"Backup-Import fehlgeschlagen: {e}")
 
-    with tabs[8]:
+    with tabs[9]:
         st.subheader("Änderungsprotokoll")
         audit_df = read_df(conn, "SELECT event_time, username, event_type, entity_type, entity_id, details_json FROM audit_log ORDER BY id DESC LIMIT 300")
         if audit_df.empty:
@@ -2561,13 +2834,14 @@ def show_admin_mode():
         else:
             st.dataframe(audit_df, use_container_width=True, height=520)
 
-    with tabs[9]:
+    with tabs[10]:
         show_system_status(conn)
 
 
 # ==================================================
 # DISPLAY MODE
 # ==================================================
+
 
 def show_display_error(message: str):
     st.markdown(
@@ -2601,7 +2875,9 @@ def show_display_mode(screen_id: int):
 
     try:
         conn = get_connection()
+        cleanup_materialized_departures(conn)
         materialize_tours_to_departures(conn)
+        materialize_holiday_tours_to_departures(conn)
         update_departure_statuses(conn)
         screens = load_screens(conn)
 
@@ -2662,6 +2938,7 @@ def show_display_mode(screen_id: int):
 # ==================================================
 # MAIN
 # ==================================================
+
 
 def main():
     params = st.query_params
