@@ -1228,7 +1228,6 @@ def render_big_table_v2(headers, rows, row_backgrounds=None, text_colors=None, e
         unsafe_allow_html=True,
     )
 
-
 def render_display_header(title: str | None = None, data: pd.DataFrame | None = None):
     now = now_berlin()
     weekday = WEEKDAYS_DE[now.weekday()]
@@ -1240,37 +1239,37 @@ def render_display_header(title: str | None = None, data: pd.DataFrame | None = 
         active = int((status_series == "GEPLANT").sum())
         ready = int((status_series == "BEREIT").sum())
         done = int((status_series == "ABGESCHLOSSEN").sum())
-        summary_html = f"""
-            <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end;margin-top:6px;">
-                <span style="background:#dbeafe;color:#1e3a8a;padding:4px 10px;border-radius:10px;font-weight:900;">Aktiv: {active}</span>
-                <span style="background:#dcfce7;color:#166534;padding:4px 10px;border-radius:10px;font-weight:900;">Bereit: {ready}</span>
-                <span style="background:#e5e7eb;color:#374151;padding:4px 10px;border-radius:10px;font-weight:900;">Fertig: {done}</span>
-            </div>
-        """
 
-    st.markdown(
-        f"""
-        <div style="
-            display:flex;
-            justify-content:space-between;
-            align-items:flex-start;
-            gap:18px;
-            background:#111827;
-            color:white;
-            padding:10px 16px;
-            border-radius:14px;
-            margin-bottom:10px;
-            font-weight:800;
-        ">
-            <div style="font-size:30px;line-height:1.2;">{escape_html(title or '')}</div>
-            <div style="text-align:right;">
-                <div style="font-size:26px;">{escape_html(line)}</div>
-                {summary_html}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        summary_html = (
+            f'<div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end;margin-top:6px;">'
+            f'<span style="background:#dbeafe;color:#1e3a8a;padding:4px 10px;border-radius:10px;font-weight:900;">Aktiv: {active}</span>'
+            f'<span style="background:#dcfce7;color:#166534;padding:4px 10px;border-radius:10px;font-weight:900;">Bereit: {ready}</span>'
+            f'<span style="background:#e5e7eb;color:#374151;padding:4px 10px;border-radius:10px;font-weight:900;">Fertig: {done}</span>'
+            f'</div>'
+        )
+
+    html = f"""
+<div style="
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-start;
+    gap:18px;
+    background:#111827;
+    color:white;
+    padding:10px 16px;
+    border-radius:14px;
+    margin-bottom:10px;
+    font-weight:800;
+">
+    <div style="font-size:30px;line-height:1.2;">{escape_html(title or '')}</div>
+    <div style="text-align:right;">
+        <div style="font-size:26px;">{escape_html(line)}</div>
+        {summary_html}
+    </div>
+</div>
+"""
+    st.markdown(html, unsafe_allow_html=True)
+
 
 
 def base_display_css() -> str:
