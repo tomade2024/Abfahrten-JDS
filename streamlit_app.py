@@ -19,8 +19,9 @@ except Exception:
     def st_autorefresh(interval=15000, key=None):
         return None
 
-st.set_page_config(page_title="Abfahrten V3.2", layout="wide")
+st.set_page_config(page_title="Abfahrten V3.1.1", layout="wide")
 
+# Bestehende Daten/Verzeichnisse weiterverwenden
 APP_NAME = "AbfahrtenV32"
 TZ = ZoneInfo("Europe/Berlin")
 
@@ -626,7 +627,7 @@ def export_backup_json(conn) -> bytes:
         })
 
     payload = {
-        "version": 3.2,
+        "version": "3.1.1",
         "exported_at": now_berlin().isoformat(),
         "locations": load_locations(conn).to_dict(orient="records"),
         "tours": tour_items,
@@ -721,7 +722,10 @@ def import_backup_json(conn, data: dict):
                 )
             cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(tour_id),))
             for s in t.get("stops", []):
-                cur.execute("INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)", (int(tour_id), int(s["location_id"]), int(s.get("position", 0))))
+                cur.execute(
+                    "INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)",
+                    (int(tour_id), int(s["location_id"]), int(s.get("position", 0)))
+                )
 
     for h in data.get("holiday_tours", []):
         if not h.get("name"):
@@ -752,7 +756,10 @@ def import_backup_json(conn, data: dict):
                 )
             cur.execute("DELETE FROM holiday_tour_stops WHERE holiday_tour_id=?", (int(hid),))
             for s in h.get("stops", []):
-                cur.execute("INSERT INTO holiday_tour_stops (holiday_tour_id, location_id, position) VALUES (?, ?, ?)", (int(hid), int(s["location_id"]), int(s.get("position", 0))))
+                cur.execute(
+                    "INSERT INTO holiday_tour_stops (holiday_tour_id, location_id, position) VALUES (?, ?, ?)",
+                    (int(hid), int(s["location_id"]), int(s.get("position", 0)))
+                )
 
     if "screens" in data:
         for s in data.get("screens", []):
@@ -804,9 +811,15 @@ def update_departure_statuses(conn: sqlite3.Connection):
             to_ready.append(int(r["id"]))
 
     if to_ready:
-        conn.executemany("UPDATE departures SET status='BEREIT', ready_at=COALESCE(ready_at, ?) WHERE id=?", [(now_iso, i) for i in to_ready])
+        conn.executemany(
+            "UPDATE departures SET status='BEREIT', ready_at=COALESCE(ready_at, ?) WHERE id=?",
+            [(now_iso, i) for i in to_ready]
+        )
     if to_done:
-        conn.executemany("UPDATE departures SET status='ABGESCHLOSSEN', completed_at=COALESCE(completed_at, ?) WHERE id=?", [(now_iso, i) for i in to_done])
+        conn.executemany(
+            "UPDATE departures SET status='ABGESCHLOSSEN', completed_at=COALESCE(completed_at, ?) WHERE id=?",
+            [(now_iso, i) for i in to_done]
+        )
 
     if to_ready or to_done:
         conn.commit()
@@ -823,7 +836,6 @@ def cleanup_materialized_departures(conn: sqlite3.Connection):
 
 def materialize_tours_to_departures(conn: sqlite3.Connection):
     now = now_berlin()
-    window = timedelta(hours=MATERIALIZE_TOURS_HOURS_BEFORE)
     df = read_df(conn, """
         SELECT t.id AS tour_id, t.weekday, t.hour, t.minute, t.note AS tour_note,
                t.active AS tour_active, t.screen_ids AS tour_screen_ids,
@@ -948,7 +960,16 @@ def materialize_holiday_tours_to_departures(conn: sqlite3.Connection):
     conn.commit()
 
 
-def create_manual_departures(conn, dep_dt: datetime, location_id: int, screen_ids: list[int], note: str, created_by: str, countdown_enabled: bool, cooled_required: bool):
+def create_manual_departures(
+    conn,
+    dep_dt: datetime,
+    location_id: int,
+    screen_ids: list[int],
+    note: str,
+    created_by: str,
+    countdown_enabled: bool,
+    cooled_required: bool
+):
     cur = conn.cursor()
     note_clean = (note or "").strip()
     for sid in screen_ids:
@@ -1102,7 +1123,6 @@ def get_screen_data(conn, screen_id: int):
             return f"BEREIT · Abschluss in {fmt_compact(completion_deadline(dep_dt) - now)}"
         return ""
 
-    deps["line_info"] = [build_lineInfo for build_lineInfo in []]  # placeholder to avoid lint confusion
     deps["line_info"] = [build_line_info(r) for _, r in deps.iterrows()]
     deps = deps.sort_values(["datetime", "location_name"], na_position="last").copy()
     return screen, deps
@@ -1625,7 +1645,11 @@ def show_admin_departures(conn, can_edit: bool):
             else ("MANUELL" if s.startswith("MANUAL:") else "SONST"))
         )
         view["Zeit"] = view["datetime"].apply(lambda d: ensure_tz(d).strftime("%d.%m.%Y %H:%M") if pd.notnull(d) else "")
-        st.dataframe(view[["id", "Zeit", "screen_id", "location_name", "note", "status", "countdown_enabled", "cooled_required", "Quelle"]], use_container_width=True, height=320)
+        st.dataframe(
+            view[["id", "Zeit", "screen_id", "location_name", "note", "status", "countdown_enabled", "cooled_required", "Quelle"]],
+            use_container_width=True,
+            height=320
+        )
 
     if not can_edit:
         return
@@ -1651,7 +1675,16 @@ def show_admin_departures(conn, can_edit: bool):
     if submitted and screen_ids:
         hh, mm = map(int, dep_time.split(":"))
         dep_dt = datetime.combine(dep_date, dtime(hour=hh, minute=mm)).replace(tzinfo=TZ)
-        create_manual_departures(conn, dep_dt, int(loc_id), [int(s) for s in screen_ids], note, str(st.session_state.get("username") or "ADMIN"), countdown_enabled, cooled_required)
+        create_manual_departures(
+            conn,
+            dep_dt,
+            int(loc_id),
+            [int(s) for s in screen_ids],
+            note,
+            str(st.session_state.get("username") or "ADMIN"),
+            countdown_enabled,
+            cooled_required
+        )
         save_backup_to_dir(conn)
         cleanup_old_backups()
         st.success("Gespeichert.")
@@ -1681,7 +1714,10 @@ def show_admin_locations(conn, can_edit: bool):
         submitted = st.form_submit_button("Speichern")
 
     if submitted and name.strip():
-        conn.execute("INSERT INTO locations (name, type, active, color, text_color) VALUES (?, ?, ?, ?, ?)", (name.strip(), typ, 1 if active else 0, color, text_color))
+        conn.execute(
+            "INSERT INTO locations (name, type, active, color, text_color) VALUES (?, ?, ?, ?, ?)",
+            (name.strip(), typ, 1 if active else 0, color, text_color)
+        )
         conn.commit()
         save_backup_to_dir(conn)
         cleanup_old_backups()
@@ -1699,7 +1735,11 @@ def show_admin_locations(conn, can_edit: bool):
         c1, c2, c3 = st.columns(3)
         with c1:
             edit_name = st.text_input("Name", row["name"])
-            edit_type = st.selectbox("Typ", ["KRANKENHAUS", "ALTENHEIM", "MVZ"], index=["KRANKENHAUS", "ALTENHEIM", "MVZ"].index(row["type"]) if row["type"] in ["KRANKENHAUS", "ALTENHEIM", "MVZ"] else 0)
+            edit_type = st.selectbox(
+                "Typ",
+                ["KRANKENHAUS", "ALTENHEIM", "MVZ"],
+                index=["KRANKENHAUS", "ALTENHEIM", "MVZ"].index(row["type"]) if row["type"] in ["KRANKENHAUS", "ALTENHEIM", "MVZ"] else 0
+            )
         with c2:
             edit_active = st.checkbox("Aktiv", bool(row["active"]))
             edit_color = st.color_picker("Hintergrundfarbe", row["color"] if row["color"] else "#007bff")
@@ -1710,7 +1750,10 @@ def show_admin_locations(conn, can_edit: bool):
         delete = cdel.form_submit_button("Löschen")
 
     if save and edit_name.strip():
-        conn.execute("UPDATE locations SET name=?, type=?, active=?, color=?, text_color=? WHERE id=?", (edit_name.strip(), edit_type, 1 if edit_active else 0, edit_color, edit_text_color, int(selected)))
+        conn.execute(
+            "UPDATE locations SET name=?, type=?, active=?, color=?, text_color=? WHERE id=?",
+            (edit_name.strip(), edit_type, 1 if edit_active else 0, edit_color, edit_text_color, int(selected))
+        )
         conn.commit()
         save_backup_to_dir(conn)
         cleanup_old_backups()
@@ -1727,6 +1770,56 @@ def show_admin_locations(conn, can_edit: bool):
             st.rerun()
         except Exception as e:
             st.error(str(e))
+
+
+def export_tours_csv(conn):
+    tours_df = read_df(conn, """
+        SELECT
+            t.id,
+            t.name,
+            t.weekday,
+            t.hour,
+            t.minute,
+            t.location_id,
+            l.name AS location_name,
+            t.note,
+            t.active,
+            t.screen_ids,
+            t.countdown_enabled,
+            t.cooled_required
+        FROM tours t
+        LEFT JOIN locations l ON l.id = t.location_id
+        ORDER BY
+            CASE t.weekday
+                WHEN 'Montag' THEN 1
+                WHEN 'Dienstag' THEN 2
+                WHEN 'Mittwoch' THEN 3
+                WHEN 'Donnerstag' THEN 4
+                WHEN 'Freitag' THEN 5
+                WHEN 'Samstag' THEN 6
+                WHEN 'Sonntag' THEN 7
+                ELSE 99
+            END,
+            t.hour,
+            t.minute,
+            t.name
+    """)
+
+    stops_df = read_df(conn, """
+        SELECT
+            ts.id,
+            ts.tour_id,
+            t.name AS tour_name,
+            ts.position,
+            ts.location_id,
+            l.name AS location_name
+        FROM tour_stops ts
+        JOIN tours t ON t.id = ts.tour_id
+        JOIN locations l ON l.id = ts.location_id
+        ORDER BY ts.tour_id, ts.position
+    """)
+
+    return df_to_csv_bytes(tours_df), df_to_csv_bytes(stops_df)
 
 
 def show_admin_tours(conn, can_edit: bool):
@@ -1751,7 +1844,11 @@ def show_admin_tours(conn, can_edit: bool):
         if weekday_filter != "ALLE":
             view = view[view["weekday"] == weekday_filter]
         view["Zeit"] = view.apply(lambda r: f"{int(r['hour']):02d}:{int(r['minute']):02d}", axis=1)
-        st.dataframe(view[["id", "name", "weekday", "Zeit", "countdown_enabled", "cooled_required", "location_name", "note", "active", "screen_ids"]], use_container_width=True, height=280)
+        st.dataframe(
+            view[["id", "name", "weekday", "Zeit", "countdown_enabled", "cooled_required", "location_name", "note", "active", "screen_ids"]],
+            use_container_width=True,
+            height=280
+        )
     else:
         st.info("Noch keine Touren vorhanden.")
 
@@ -1778,9 +1875,14 @@ def show_admin_tours(conn, can_edit: bool):
             time_label = st.selectbox("Uhrzeit", time_options_half_hour(), index=time_options_half_hour().index("08:00"))
         with c3:
             screens_new = st.multiselect("Monitore", options=screens["id"].tolist())
+
         countdown_enabled = st.checkbox("Countdown aktiv", False)
         cooled_required = st.checkbox("Kühlware mitzunehmen", False)
-        stops_new = st.multiselect("Stops", options=locations["id"].tolist(), format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0])
+        stops_new = st.multiselect(
+            "Stops",
+            options=locations["id"].tolist(),
+            format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0]
+        )
         note_new = st.text_input("Hinweis")
         active_new = st.checkbox("Aktiv", True)
         submitted = st.form_submit_button("Tour speichern")
@@ -1790,7 +1892,18 @@ def show_admin_tours(conn, can_edit: bool):
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO tours (name, weekday, hour, minute, location_id, note, active, screen_ids, countdown_enabled, cooled_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (tour_name.strip(), weekday, hh, mm, int(stops_new[0]), note_new.strip(), 1 if active_new else 0, ",".join(map(str, screens_new)), 1 if countdown_enabled else 0, 1 if cooled_required else 0),
+            (
+                tour_name.strip(),
+                weekday,
+                hh,
+                mm,
+                int(stops_new[0]),
+                note_new.strip(),
+                1 if active_new else 0,
+                ",".join(map(str, screens_new)),
+                1 if countdown_enabled else 0,
+                1 if cooled_required else 0,
+            ),
         )
         tour_id = cur.lastrowid
         for pos, loc_id in enumerate(stops_new):
@@ -1801,16 +1914,199 @@ def show_admin_tours(conn, can_edit: bool):
         st.success("Tour gespeichert.")
         st.rerun()
 
+    if tours.empty:
+        return
+
+    st.markdown("### Tour bearbeiten / löschen")
+    selected_tour_id = st.selectbox(
+        "Tour auswählen",
+        tours["id"].tolist(),
+        format_func=lambda i: f"{int(i)} – {tours.loc[tours['id'] == i, 'name'].iloc[0]}",
+        key="edit_tour_select"
+    )
+
+    tour_row = tours.loc[tours["id"] == selected_tour_id].iloc[0]
+    stops_df = load_tour_stops(conn, int(selected_tour_id))
+    current_stop_ids = stops_df["location_id"].astype(int).tolist() if not stops_df.empty else []
+    current_screen_ids = parse_screen_ids(tour_row.get("screen_ids"))
+
+    weekday_options = WEEKDAYS_DE
+    weekday_index = weekday_options.index(tour_row["weekday"]) if tour_row["weekday"] in weekday_options else 0
+
+    current_time = f"{int(tour_row['hour']):02d}:{int(tour_row['minute']):02d}"
+    time_options = time_options_half_hour()
+    time_index = time_options.index(current_time) if current_time in time_options else 0
+
+    with st.form("edit_tour_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            edit_tour_name = st.text_input("Tour-Name", value=str(tour_row["name"]))
+            edit_weekday = st.selectbox("Wochentag", weekday_options, index=weekday_index)
+        with c2:
+            edit_time_label = st.selectbox("Uhrzeit", time_options, index=time_index)
+            edit_screens = st.multiselect("Monitore", options=screens["id"].tolist(), default=current_screen_ids)
+        with c3:
+            edit_countdown_enabled = st.checkbox("Countdown aktiv", value=bool(int(tour_row.get("countdown_enabled", 0) or 0)))
+            edit_cooled_required = st.checkbox("Kühlware mitzunehmen", value=bool(int(tour_row.get("cooled_required", 0) or 0)))
+            edit_active = st.checkbox("Aktiv", value=bool(int(tour_row.get("active", 1) or 1)))
+
+        edit_stops = st.multiselect(
+            "Stops",
+            options=locations["id"].tolist(),
+            default=current_stop_ids,
+            format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0]
+        )
+        edit_note = st.text_input("Hinweis", value=str(tour_row["note"] or ""))
+
+        csave, cdel = st.columns(2)
+        save_edit = csave.form_submit_button("Tour aktualisieren")
+        delete_tour = cdel.form_submit_button("Tour löschen")
+
+    if save_edit:
+        if not edit_tour_name.strip():
+            st.error("Tour-Name fehlt.")
+        elif not edit_screens:
+            st.error("Mindestens ein Monitor muss gewählt werden.")
+        elif not edit_stops:
+            st.error("Mindestens ein Stop muss gewählt werden.")
+        else:
+            hh, mm = map(int, edit_time_label.split(":"))
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE tours
+                SET name=?, weekday=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=?, cooled_required=?
+                WHERE id=?
+                """,
+                (
+                    edit_tour_name.strip(),
+                    edit_weekday,
+                    hh,
+                    mm,
+                    int(edit_stops[0]),
+                    edit_note.strip(),
+                    1 if edit_active else 0,
+                    ",".join(map(str, edit_screens)),
+                    1 if edit_countdown_enabled else 0,
+                    1 if edit_cooled_required else 0,
+                    int(selected_tour_id),
+                ),
+            )
+
+            cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(selected_tour_id),))
+            for pos, loc_id in enumerate(edit_stops):
+                cur.execute("INSERT INTO tour_stops (tour_id, location_id, position) VALUES (?, ?, ?)", (int(selected_tour_id), int(loc_id), pos))
+
+            conn.execute("DELETE FROM departures WHERE source_key LIKE ?", (f"TOUR:{int(selected_tour_id)}:%",))
+            conn.commit()
+
+            materialize_tours_to_departures(conn)
+            update_departure_statuses(conn)
+            save_backup_to_dir(conn)
+            cleanup_old_backups()
+            st.success("Tour aktualisiert.")
+            st.rerun()
+
+    if delete_tour:
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM tour_stops WHERE tour_id=?", (int(selected_tour_id),))
+            cur.execute("DELETE FROM tours WHERE id=?", (int(selected_tour_id),))
+            cur.execute("DELETE FROM departures WHERE source_key LIKE ?", (f"TOUR:{int(selected_tour_id)}:%",))
+            conn.commit()
+            save_backup_to_dir(conn)
+            cleanup_old_backups()
+            st.success("Tour gelöscht.")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+
+def export_holiday_tours_csv(conn):
+    holiday_tours_df = read_df(conn, """
+        SELECT
+            h.id,
+            h.name,
+            h.holiday_date,
+            h.hour,
+            h.minute,
+            h.location_id,
+            l.name AS location_name,
+            h.note,
+            h.active,
+            h.screen_ids,
+            h.countdown_enabled,
+            h.cooled_required
+        FROM holiday_tours h
+        LEFT JOIN locations l ON l.id = h.location_id
+        ORDER BY
+            h.holiday_date,
+            h.hour,
+            h.minute,
+            h.name
+    """)
+
+    holiday_stops_df = read_df(conn, """
+        SELECT
+            hs.id,
+            hs.holiday_tour_id,
+            h.name AS holiday_tour_name,
+            hs.position,
+            hs.location_id,
+            l.name AS location_name
+        FROM holiday_tour_stops hs
+        JOIN holiday_tours h ON h.id = hs.holiday_tour_id
+        JOIN locations l ON l.id = hs.location_id
+        ORDER BY
+            hs.holiday_tour_id,
+            hs.position
+    """)
+
+    return df_to_csv_bytes(holiday_tours_df), df_to_csv_bytes(holiday_stops_df)
+
 
 def show_admin_holiday_tours(conn, can_edit: bool):
     st.subheader("Feiertagsbelieferung")
     holiday_tours = load_holiday_tours(conn)
+
+    with st.expander("Filter / Suche", expanded=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            search_text = st.text_input("Suche Name / Hinweis", key="holiday_search_text")
+        with c2:
+            date_filter = st.text_input("Datum filtern (YYYY-MM-DD)", key="holiday_date_filter")
+
     if not holiday_tours.empty:
         view = holiday_tours.copy()
+
+        if search_text.strip():
+            q = search_text.strip().lower()
+            view = view[
+                view["name"].fillna("").astype(str).str.lower().str.contains(q)
+                | view["note"].fillna("").astype(str).str.lower().str.contains(q)
+            ]
+
+        if date_filter.strip():
+            view = view[
+                view["holiday_date"].fillna("").astype(str).str.contains(date_filter.strip(), regex=False)
+            ]
+
         view["Zeit"] = view.apply(lambda r: f"{int(r['hour']):02d}:{int(r['minute']):02d}", axis=1)
-        st.dataframe(view[["id", "name", "holiday_date", "Zeit", "countdown_enabled", "cooled_required", "location_name", "note", "active", "screen_ids"]], use_container_width=True, height=300)
+
+        st.dataframe(
+            view[["id", "name", "holiday_date", "Zeit", "countdown_enabled", "cooled_required", "location_name", "note", "active", "screen_ids"]],
+            use_container_width=True,
+            height=300
+        )
     else:
         st.info("Noch keine Feiertagsbelieferungen vorhanden.")
+
+    holiday_tours_csv, holiday_stops_csv = export_holiday_tours_csv(conn)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("Feiertagsbelieferung CSV", data=holiday_tours_csv, file_name="feiertagsbelieferung.csv", mime="text/csv")
+    with c2:
+        st.download_button("Feiertags-Stopps CSV", data=holiday_stops_csv, file_name="feiertags_stops.csv", mime="text/csv")
 
     if not can_edit:
         return
@@ -1855,6 +2151,118 @@ def show_admin_holiday_tours(conn, can_edit: bool):
         cleanup_old_backups()
         st.success("Gespeichert.")
         st.rerun()
+
+    if holiday_tours.empty:
+        return
+
+    st.markdown("### Feiertagsbelieferung bearbeiten / löschen")
+    selected_holiday_id = st.selectbox(
+        "Feiertagsbelieferung auswählen",
+        holiday_tours["id"].tolist(),
+        format_func=lambda i: f"{int(i)} – {holiday_tours.loc[holiday_tours['id'] == i, 'name'].iloc[0]}",
+        key="edit_holiday_tour_select"
+    )
+
+    holiday_row = holiday_tours.loc[holiday_tours["id"] == selected_holiday_id].iloc[0]
+    holiday_stops_df = load_holiday_tour_stops(conn, int(selected_holiday_id))
+    current_holiday_stop_ids = holiday_stops_df["location_id"].astype(int).tolist() if not holiday_stops_df.empty else []
+    current_holiday_screen_ids = parse_screen_ids(holiday_row.get("screen_ids"))
+
+    current_holiday_time = f"{int(holiday_row['hour']):02d}:{int(holiday_row['minute']):02d}"
+    time_options = time_options_half_hour()
+    time_index = time_options.index(current_holiday_time) if current_holiday_time in time_options else 0
+
+    try:
+        current_holiday_date = pd.to_datetime(holiday_row["holiday_date"]).date()
+    except Exception:
+        current_holiday_date = now_berlin().date()
+
+    with st.form("edit_holiday_tour_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            edit_holiday_name = st.text_input("Name", value=str(holiday_row["name"]))
+            edit_holiday_date = st.date_input("Datum", value=current_holiday_date)
+        with c2:
+            edit_holiday_time = st.selectbox("Uhrzeit", time_options, index=time_index)
+            edit_holiday_screens = st.multiselect("Monitore", options=screens["id"].tolist(), default=current_holiday_screen_ids)
+        with c3:
+            edit_holiday_countdown = st.checkbox("Countdown aktiv", value=bool(int(holiday_row.get("countdown_enabled", 0) or 0)))
+            edit_holiday_cooled = st.checkbox("Kühlware mitzunehmen", value=bool(int(holiday_row.get("cooled_required", 0) or 0)))
+            edit_holiday_active = st.checkbox("Aktiv", value=bool(int(holiday_row.get("active", 1) or 1)))
+
+        edit_holiday_stops = st.multiselect(
+            "Stops",
+            options=locations["id"].tolist(),
+            default=current_holiday_stop_ids,
+            format_func=lambda i: locations.loc[locations["id"] == i, "name"].values[0]
+        )
+        edit_holiday_note = st.text_input("Hinweis", value=str(holiday_row["note"] or ""))
+
+        csave, cdel = st.columns(2)
+        save_holiday_edit = csave.form_submit_button("Feiertagsbelieferung aktualisieren")
+        delete_holiday = cdel.form_submit_button("Feiertagsbelieferung löschen")
+
+    if save_holiday_edit:
+        if not edit_holiday_name.strip():
+            st.error("Name fehlt.")
+        elif not edit_holiday_screens:
+            st.error("Mindestens ein Monitor muss gewählt werden.")
+        elif not edit_holiday_stops:
+            st.error("Mindestens ein Stop muss gewählt werden.")
+        else:
+            hh, mm = map(int, edit_holiday_time.split(":"))
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE holiday_tours
+                SET name=?, holiday_date=?, hour=?, minute=?, location_id=?, note=?, active=?, screen_ids=?, countdown_enabled=?, cooled_required=?
+                WHERE id=?
+                """,
+                (
+                    edit_holiday_name.strip(),
+                    edit_holiday_date.isoformat(),
+                    hh,
+                    mm,
+                    int(edit_holiday_stops[0]),
+                    edit_holiday_note.strip(),
+                    1 if edit_holiday_active else 0,
+                    ",".join(map(str, edit_holiday_screens)),
+                    1 if edit_holiday_countdown else 0,
+                    1 if edit_holiday_cooled else 0,
+                    int(selected_holiday_id),
+                ),
+            )
+
+            cur.execute("DELETE FROM holiday_tour_stops WHERE holiday_tour_id=?", (int(selected_holiday_id),))
+            for pos, loc_id in enumerate(edit_holiday_stops):
+                cur.execute(
+                    "INSERT INTO holiday_tour_stops (holiday_tour_id, location_id, position) VALUES (?, ?, ?)",
+                    (int(selected_holiday_id), int(loc_id), pos)
+                )
+
+            conn.execute("DELETE FROM departures WHERE source_key LIKE ?", (f"HOLIDAY:{int(selected_holiday_id)}:%",))
+            conn.commit()
+
+            materialize_holiday_tours_to_departures(conn)
+            update_departure_statuses(conn)
+            save_backup_to_dir(conn)
+            cleanup_old_backups()
+            st.success("Feiertagsbelieferung aktualisiert.")
+            st.rerun()
+
+    if delete_holiday:
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM holiday_tour_stops WHERE holiday_tour_id=?", (int(selected_holiday_id),))
+            cur.execute("DELETE FROM holiday_tours WHERE id=?", (int(selected_holiday_id),))
+            cur.execute("DELETE FROM departures WHERE source_key LIKE ?", (f"HOLIDAY:{int(selected_holiday_id)}:%",))
+            conn.commit()
+            save_backup_to_dir(conn)
+            cleanup_old_backups()
+            st.success("Feiertagsbelieferung gelöscht.")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
 
 
 def show_admin_cold_goods(conn, can_edit: bool):
@@ -2006,7 +2414,7 @@ def show_admin_mode():
     username = st.session_state.get("username", "")
     can_edit = role == "admin"
 
-    st.title("Abfahrten – V3.2")
+    st.title("Abfahrten – V3.1.1")
     st.caption(f"Eingeloggt als: {username} ({role}) • DB: {DB_PATH}")
 
     if st.sidebar.button("Logout"):
